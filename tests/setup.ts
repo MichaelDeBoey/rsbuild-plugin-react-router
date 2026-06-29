@@ -3,10 +3,16 @@ import { afterEach, rstest } from '@rstest/core';
 
 type ReactRouterTestGlobal = typeof globalThis & {
   __reactRouterTestConfig?: unknown;
+  __reactRouterTestJitiCache?: Record<string, unknown>;
+  __reactRouterTestJitiCacheAfterImport?: Record<string, unknown>;
 };
 
+const testGlobal = globalThis as ReactRouterTestGlobal;
+
 afterEach(() => {
-  delete (globalThis as ReactRouterTestGlobal).__reactRouterTestConfig;
+  delete testGlobal.__reactRouterTestConfig;
+  delete testGlobal.__reactRouterTestJitiCache;
+  delete testGlobal.__reactRouterTestJitiCacheAfterImport;
 });
 
 // Mock the file system
@@ -15,40 +21,52 @@ rstest.spyOn(fs, 'existsSync').mockReturnValue(true);
 
 // Mock jiti
 rstest.mock('jiti', () => ({
-  createJiti: () => ({
-    import: rstest.fn().mockImplementation((path) => {
-      if (path.includes('routes.ts')) {
-        const routeCount = Number(process.env.RR_TEST_ROUTE_COUNT ?? 0);
-        if (routeCount > 0) {
-          const childRouteCount = Math.max(0, routeCount - 1);
-          return Promise.resolve(
-            Array.from({ length: childRouteCount }, (_, index) => ({
-              id: `routes/route-${index}`,
-              file: `routes/route-${index}.tsx`,
-              index: index === 0,
-            }))
-          );
+  createJiti: (_cwd: string, options?: { moduleCache?: boolean }) => {
+    const useSharedCache = options?.moduleCache !== false;
+    const cache = useSharedCache
+      ? (testGlobal.__reactRouterTestJitiCache ?? {})
+      : {};
+
+    return {
+      cache,
+      import: rstest.fn().mockImplementation((path) => {
+        const cacheAfterImport = testGlobal.__reactRouterTestJitiCacheAfterImport;
+        if (useSharedCache && cacheAfterImport) {
+          Object.assign(cache, cacheAfterImport);
         }
-        return Promise.resolve([
-          {
-            id: 'routes/index',
-            file: 'routes/index.tsx',
-            index: true,
-          },
-        ]);
-      }
-      if (process.env.RR_TEST_SPLIT_ROUTE_MODULES === 'true') {
-        return Promise.resolve({
-          ...((globalThis as ReactRouterTestGlobal)
-            .__reactRouterTestConfig as object | undefined),
-          splitRouteModules: true,
-        });
-      }
-      return Promise.resolve(
-        (globalThis as ReactRouterTestGlobal).__reactRouterTestConfig ?? {}
-      );
-    }),
-  }),
+
+        if (path.includes('routes.ts')) {
+          const routeCount = Number(process.env.RR_TEST_ROUTE_COUNT ?? 0);
+          if (routeCount > 0) {
+            const childRouteCount = Math.max(0, routeCount - 1);
+            return Promise.resolve(
+              Array.from({ length: childRouteCount }, (_, index) => ({
+                id: `routes/route-${index}`,
+                file: `routes/route-${index}.tsx`,
+                index: index === 0,
+              }))
+            );
+          }
+          return Promise.resolve([
+            {
+              id: 'routes/index',
+              file: 'routes/index.tsx',
+              index: true,
+            },
+          ]);
+        }
+        if (process.env.RR_TEST_SPLIT_ROUTE_MODULES === 'true') {
+          return Promise.resolve({
+            ...(testGlobal.__reactRouterTestConfig as object | undefined),
+            splitRouteModules: true,
+          });
+        }
+        return Promise.resolve(
+          testGlobal.__reactRouterTestConfig ?? {}
+        );
+      }),
+    };
+  },
 }));
 
 // Mock webpack sources
