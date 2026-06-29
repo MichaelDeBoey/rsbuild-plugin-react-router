@@ -13,6 +13,7 @@ import {
   createBuild,
   createGraphStats,
   createManifestSet,
+  createManifestSetWithRoute,
   createStats,
 } from './dev-runtime-fixtures';
 
@@ -505,6 +506,41 @@ describe('React Router development runtime controller', () => {
     expect(server.sockWrite).toHaveBeenNthCalledWith(2, 'full-reload', {
       path: '*',
     });
+  });
+
+  it('hard reloads when route export metadata changes', async () => {
+    const { callbacks, controller, loadBundle, server } = createHarness();
+    loadBundle.mockImplementation(() => createBuild('base'));
+    const web = createCompiler('web');
+    const node = createCompiler('node');
+    await callbacks.start({ server });
+    callbacks.created({
+      compiler: { compilers: [web.compiler, node.compiler] },
+    });
+    const finishCompile = async (
+      version: string,
+      route: Parameters<typeof createManifestSetWithRoute>[2]
+    ) => {
+      callbacks.before();
+      const webCompilation = web.compile();
+      controller.captureWeb(
+        webCompilation,
+        createManifestSetWithRoute(version, 'routes/about', route)
+      );
+      web.complete(webCompilation);
+      const nodeCompilation = node.compile();
+      await callbacks.after({
+        stats: createGraphStats(webCompilation, nodeCompilation),
+      });
+    };
+
+    await finishCompile('web-base', { hasClientLoader: false });
+    await finishCompile('web-next', {
+      hasClientLoader: true,
+      clientLoaderModule: '/routes/about.clientLoader.js',
+    });
+
+    expect(server.sockWrite).toHaveBeenCalledWith('full-reload', { path: '*' });
   });
 
   it('publishes a safe node-only compile after the aggregate pre-hook', async () => {

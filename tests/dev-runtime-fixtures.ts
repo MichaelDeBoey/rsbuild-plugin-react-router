@@ -59,23 +59,31 @@ export const createBuild = (
     ssr: true,
   }) as unknown as TestServerBuild;
 
-const createRouteManifest = (
+type RouteManifestOptions = Partial<
+  Omit<
+    ReactRouterDevManifest['routes'][string],
+    'css' | 'id' | 'imports' | 'module'
+  >
+> & { imports?: string[] };
+
+export const createRouteManifest = (
   id: string,
   css: string[],
-  imports: string[] = []
+  { imports = [], ...overrides }: RouteManifestOptions = {}
 ): ReactRouterDevManifest['routes'][string] => ({
-  id,
-  module: `/${id}.js`,
-  hasAction: false,
-  hasLoader: false,
-  hasClientAction: false,
-  hasClientLoader: false,
-  hasClientMiddleware: false,
-  hasDefaultExport: true,
-  hasErrorBoundary: false,
-  imports,
-  css,
-});
+    id,
+    module: `/${id}.js`,
+    hasAction: false,
+    hasLoader: false,
+    hasClientAction: false,
+    hasClientLoader: false,
+    hasClientMiddleware: false,
+    hasDefaultExport: true,
+    hasErrorBoundary: false,
+    imports,
+    css,
+    ...overrides,
+  });
 
 export type DevManifestCss = {
   entry?: string[];
@@ -93,7 +101,7 @@ export const createDevManifest = (
   routes: Object.fromEntries(
     Object.entries(css.routes ?? {}).map(([id, routeCss]) => [
       id,
-      createRouteManifest(id, routeCss, css.routeImports?.[id]),
+      createRouteManifest(id, routeCss, { imports: css.routeImports?.[id] }),
     ])
   ),
 });
@@ -103,6 +111,19 @@ export const createManifestSet = (
   css: DevManifestCss = {}
 ) => ({
   'static/js/app': createDevManifest(version, css),
+});
+
+export const createManifestSetWithRoute = (
+  version: string,
+  routeId: string,
+  route: RouteManifestOptions
+) => ({
+  'static/js/app': {
+    ...createDevManifest(version),
+    routes: {
+      [routeId]: createRouteManifest(routeId, [], route),
+    },
+  },
 });
 
 export const createCompilation = (

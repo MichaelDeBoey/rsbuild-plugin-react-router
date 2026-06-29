@@ -75,6 +75,7 @@ type CreateReactRouterDevRuntimeOptions = {
   buildPlan: ReactRouterDevBuildPlan;
   onEvaluationError: (error: Error) => void;
   onCssAssetOwnershipChanged?: (change: 'removed' | 'restored') => void;
+  onRouteManifestChanged?: () => void;
   onWarning?: (message: string) => void;
 };
 
@@ -194,6 +195,61 @@ const hasOnlyCssAssetOwnershipChanges = (
   });
 };
 
+type DevRouteManifestEntry = NonNullable<
+  ReactRouterDevManifestSet[string]['routes']
+>[string];
+
+const hasSameRouteMetadata = (
+  previous: DevRouteManifestEntry,
+  next: DevRouteManifestEntry
+): boolean =>
+  previous.caseSensitive === next.caseSensitive &&
+  previous.clientActionModule === next.clientActionModule &&
+  previous.clientLoaderModule === next.clientLoaderModule &&
+  previous.clientMiddlewareModule === next.clientMiddlewareModule &&
+  previous.hasErrorBoundary === next.hasErrorBoundary &&
+  previous.hasAction === next.hasAction &&
+  previous.hasClientAction === next.hasClientAction &&
+  previous.hasClientLoader === next.hasClientLoader &&
+  previous.hasClientMiddleware === next.hasClientMiddleware &&
+  previous.hasDefaultExport === next.hasDefaultExport &&
+  previous.hasLoader === next.hasLoader &&
+  previous.hydrateFallbackModule === next.hydrateFallbackModule &&
+  previous.id === next.id &&
+  previous.index === next.index &&
+  previous.parentId === next.parentId &&
+  previous.path === next.path;
+
+const hasRouteManifestMetadataChanges = (
+  previous: ReactRouterDevManifestSet,
+  next: ReactRouterDevManifestSet
+): boolean => {
+  const previousEntryNames = Object.keys(previous);
+  if (previousEntryNames.length !== Object.keys(next).length) {
+    return true;
+  }
+  for (const entryName of previousEntryNames) {
+    const nextManifest = next[entryName];
+    if (!nextManifest) {
+      return true;
+    }
+    const previousRoutes = previous[entryName].routes ?? {};
+    const nextRoutes = nextManifest.routes ?? {};
+    const previousRouteIds = Object.keys(previousRoutes);
+    if (previousRouteIds.length !== Object.keys(nextRoutes).length) {
+      return true;
+    }
+    for (const routeId of previousRouteIds) {
+      const previousRoute = previousRoutes[routeId];
+      const nextRoute = nextRoutes[routeId];
+      if (!nextRoute || !hasSameRouteMetadata(previousRoute, nextRoute)) {
+        return true;
+      }
+    }
+  }
+  return false;
+};
+
 const createDeferred = <T>(): Deferred<T> => {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -212,6 +268,7 @@ export const createReactRouterDevRuntime = ({
   buildPlan,
   onEvaluationError,
   onCssAssetOwnershipChanged = () => undefined,
+  onRouteManifestChanged = () => undefined,
   onWarning = () => undefined,
 }: CreateReactRouterDevRuntimeOptions): ReactRouterDevRuntime => {
   let nextAttemptId = 1;
@@ -235,6 +292,17 @@ export const createReactRouterDevRuntime = ({
       const reason = cause instanceof Error ? cause.message : String(cause);
       onWarning(
         `[rsbuild-plugin-react-router] Failed to notify the browser after CSS asset ownership changed: ${reason}`
+      );
+    }
+  };
+
+  const notifyRouteManifestChanged = (): void => {
+    try {
+      onRouteManifestChanged();
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      onWarning(
+        `[rsbuild-plugin-react-router] Failed to notify the browser after route manifest metadata changed: ${reason}`
       );
     }
   };
@@ -452,6 +520,13 @@ export const createReactRouterDevRuntime = ({
           previous.web.manifestsByEntryName,
           manifestsByEntryName
         );
+      const routeManifestMetadataChanged =
+        !!previous &&
+        webChanged &&
+        hasRouteManifestMetadataChanges(
+          previous.web.manifestsByEntryName,
+          manifestsByEntryName
+        );
       const reusePreviousNodeBuild = !!previous && cssOnlyWebManifestChange;
 
       if (
@@ -518,6 +593,9 @@ export const createReactRouterDevRuntime = ({
             notifyCssAssetOwnershipChanged('restored');
           }
           reloadAfterCssRemoval = false;
+        }
+        if (routeManifestMetadataChanged) {
+          notifyRouteManifestChanged();
         }
       } catch (cause) {
         rejectAttempt(

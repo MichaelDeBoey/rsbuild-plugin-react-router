@@ -3,6 +3,7 @@ import { describe, expect, it, rstest } from '@rstest/core';
 import { loadReactRouterServerBuild } from '../src';
 import {
   createReactRouterDevRuntime,
+  type DevGraphChanges,
   registerReactRouterDevRuntime,
   unregisterReactRouterDevRuntime,
 } from '../src/dev-generation';
