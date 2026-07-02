@@ -26,6 +26,7 @@ jobs:
       BENCHMARK_ITERATIONS: '10'
       BENCHMARK_WARMUP: '0'
       BENCHMARK_DEV_ROUTES: auto
+      BENCHMARK_LOG_PERFORMANCE: '1'
       BENCHMARK_HISTORY_BRANCH: benchmark-results
       SYNTHETIC_BENCHMARK_PROFILE: all
       SYNTHETIC_BENCHMARK_RUNS: '2'
@@ -108,7 +109,7 @@ jobs:
               'head/.nvmrc',
               'head/package.json',
               'head/pnpm-lock.yaml',
-              'head/scripts/bench-builds.mjs',
+              'head/scripts/bench-builds.mts',
               'head/scripts/bench-synthetic-app.mjs',
               'head/scripts/benchmark/**',
               'head/benchmarks/synthetic-web-bundler-benchmark/**',
@@ -117,7 +118,8 @@ jobs:
             ) }}-${{ env.BENCHMARK_PROFILE }}-${{ env.BENCHMARK_BUILD_ITERATIONS }}-${{
             env.BENCHMARK_LARGE_ITERATIONS }}-${{ env.BENCHMARK_MODE }}-${{
             env.BENCHMARK_ITERATIONS }}-${{ env.BENCHMARK_WARMUP }}-${{
-            env.BENCHMARK_DEV_ROUTES }}-${{ env.SYNTHETIC_BENCHMARK_PROFILE }}-${{
+            env.BENCHMARK_DEV_ROUTES }}-${{ env.BENCHMARK_LOG_PERFORMANCE }}-${{
+            env.SYNTHETIC_BENCHMARK_PROFILE }}-${{
             env.SYNTHETIC_BENCHMARK_RUNS }}
 
       - name: Validate cached base benchmark results
@@ -138,7 +140,7 @@ jobs:
         env:
           REACT_ROUTER_BENCHMARK_PLUGIN_REACT_IMPORT: ${{ steps.benchmark-imports.outputs.PLUGIN_REACT_IMPORT }}
         run: |
-          node "$GITHUB_WORKSPACE/head/scripts/bench-builds.mjs" \
+          node "$GITHUB_WORKSPACE/head/scripts/bench-builds.mts" \
             --profile "$BENCHMARK_PROFILE" \
             --mode build \
             --iterations "$BENCHMARK_BUILD_ITERATIONS" \
@@ -146,12 +148,13 @@ jobs:
             --warmup "$BENCHMARK_WARMUP" \
             --clean build \
             --format both \
+            $(if [ "$BENCHMARK_LOG_PERFORMANCE" = "1" ]; then printf '%s\n' --log-performance; fi) \
             --out "$GITHUB_WORKSPACE/benchmark-output/build/base"
 
       - name: Benchmark head production build
         working-directory: head
         run: |
-          node scripts/bench-builds.mjs \
+          node scripts/bench-builds.mts \
             --profile "$BENCHMARK_PROFILE" \
             --mode build \
             --iterations "$BENCHMARK_BUILD_ITERATIONS" \
@@ -159,6 +162,7 @@ jobs:
             --warmup "$BENCHMARK_WARMUP" \
             --clean build \
             --format both \
+            $(if [ "$BENCHMARK_LOG_PERFORMANCE" = "1" ]; then printf '%s\n' --log-performance; fi) \
             --out "$GITHUB_WORKSPACE/benchmark-output/build/head"
 
       - name: Benchmark base dev
@@ -167,7 +171,7 @@ jobs:
         env:
           REACT_ROUTER_BENCHMARK_PLUGIN_REACT_IMPORT: ${{ steps.benchmark-imports.outputs.PLUGIN_REACT_IMPORT }}
         run: |
-          node "$GITHUB_WORKSPACE/head/scripts/bench-builds.mjs" \
+          node "$GITHUB_WORKSPACE/head/scripts/bench-builds.mts" \
             --profile "$BENCHMARK_PROFILE" \
             --mode "$BENCHMARK_MODE" \
             --iterations "$BENCHMARK_ITERATIONS" \
@@ -176,12 +180,13 @@ jobs:
             --dev-routes "$BENCHMARK_DEV_ROUTES" \
             --clean build \
             --format both \
+            $(if [ "$BENCHMARK_LOG_PERFORMANCE" = "1" ]; then printf '%s\n' --log-performance; fi) \
             --out "$GITHUB_WORKSPACE/benchmark-output/dev/base"
 
       - name: Benchmark head dev
         working-directory: head
         run: |
-          node scripts/bench-builds.mjs \
+          node scripts/bench-builds.mts \
             --profile "$BENCHMARK_PROFILE" \
             --mode "$BENCHMARK_MODE" \
             --iterations "$BENCHMARK_ITERATIONS" \
@@ -190,6 +195,7 @@ jobs:
             --dev-routes "$BENCHMARK_DEV_ROUTES" \
             --clean build \
             --format both \
+            $(if [ "$BENCHMARK_LOG_PERFORMANCE" = "1" ]; then printf '%s\n' --log-performance; fi) \
             --out "$GITHUB_WORKSPACE/benchmark-output/dev/head"
 
       - name: Benchmark embedded synthetic app with base plugin
@@ -226,7 +232,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          node scripts/report-benchmark-ci.mjs \
+          node scripts/report-benchmark-ci.mts \
             --base "$GITHUB_WORKSPACE/benchmark-output/dev/base/baseline.json" \
             --head "$GITHUB_WORKSPACE/benchmark-output/dev/head/baseline.json" \
             --build-base "$GITHUB_WORKSPACE/benchmark-output/build/base/baseline.json" \
@@ -243,6 +249,13 @@ jobs:
                 --synthetic-base "$GITHUB_WORKSPACE/benchmark-output/synthetic/base/latest.json" \
                 --synthetic-head "$GITHUB_WORKSPACE/benchmark-output/synthetic/head/latest.json"
             fi)
+
+      - name: Generate benchmark diagnostics
+        working-directory: head
+        run: |
+          node scripts/benchmark/ci-diagnostics.mjs \
+            --root "$GITHUB_WORKSPACE/benchmark-output" \
+            --out "$GITHUB_WORKSPACE/benchmark-output/diagnostics"
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
