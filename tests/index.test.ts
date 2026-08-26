@@ -343,6 +343,34 @@ describe('pluginReactRouter', () => {
     ).toBe(true);
   });
 
+  it('preserves user web splitChunks overrides', async () => {
+    const rsbuild = await createStubRsbuild({
+      rsbuildConfig: {
+        environments: {
+          web: {
+            tools: {
+              rspack: {
+                optimization: {
+                  splitChunks: { chunks: 'all' },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    rsbuild.addPlugins([pluginReactRouter()]);
+    const config = await rsbuild.unwrapConfig();
+
+    expect(
+      config.environments?.web?.tools?.rspack?.optimization?.splitChunks
+    ).toEqual({ chunks: 'all' });
+    expect(
+      config.environments?.web?.tools?.rspack?.optimization?.runtimeChunk
+    ).toBe('single');
+  });
+
   it('reduces file size reporting overhead for medium split route builds by default', async () => {
     const restoreEnv = captureEnv([
       'RR_TEST_SPLIT_ROUTE_MODULES',

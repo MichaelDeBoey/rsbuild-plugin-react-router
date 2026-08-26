@@ -18,6 +18,7 @@ import {
   PLUGIN_NAME,
 } from './constants.js';
 import { guardReactRouterLazyCompilation } from './lazy-compilation.js';
+import { ensureFederationAsyncStartup } from './federation.js';
 import { createReactRouterDevServerSetup } from './dev-server.js';
 import {
   generateWithProps,
@@ -52,9 +53,13 @@ import {
   type RouteChunkConfig,
 } from './route-chunks.js';
 import {
-  createRouteTransformExecutor,
-  shouldParallelizeRouteTransforms,
-} from './parallel-route-transforms.js';
+  registerRouteModuleTransformRules,
+  shouldUseRouteModuleTransformLoader,
+} from './route-module-transform-rules.js';
+import {
+  executeRouteTransformTask,
+  type RouteTransformRunner,
+} from './route-transform-tasks.js';
 import { getRouteRestartMarkerPath, mergeWatchFiles } from './route-watch.js';
 import { validateRouteConfig } from './route-config.js';
 import {
@@ -105,42 +110,6 @@ export const shouldParallelizeEnvironmentBuilds = ({
   spareCoreCount?: number;
 }): boolean =>
   !isBuild && spareCoreCount >= MIN_PARALLEL_ENVIRONMENT_BUILD_SPARE_CORES;
-
-type ModuleFederationPluginLike = {
-  name?: string;
-  _options?: { experiments?: { asyncStartup?: boolean } };
-  options?: { experiments?: { asyncStartup?: boolean } };
-};
-
-const ensureFederationAsyncStartup = (
-  rspackConfig: Rspack.Configuration | undefined
-): void => {
-  if (!rspackConfig?.plugins?.length) {
-    return;
-  }
-
-  for (const plugin of rspackConfig.plugins) {
-    if (!plugin || typeof plugin !== 'object') {
-      continue;
-    }
-    const pluginName = (plugin as ModuleFederationPluginLike).name;
-    if (pluginName !== 'ModuleFederationPlugin') {
-      continue;
-    }
-
-    const pluginOptions =
-      (plugin as ModuleFederationPluginLike)._options ??
-      (plugin as ModuleFederationPluginLike).options;
-    if (!pluginOptions) {
-      continue;
-    }
-
-    pluginOptions.experiments = {
-      ...pluginOptions.experiments,
-      asyncStartup: true,
-    };
-  }
-};
 
 const cssUrlAssetExtensions =
   /\.(?:css|less|sass|scss|styl|stylus|pcss|postcss|sss)$/;
@@ -429,14 +398,11 @@ export const pluginReactRouter = (
       rootRouteFile,
     };
     const routeChunkCache: RouteChunkCache = new Map();
-    const routeTransformExecutor = createRouteTransformExecutor({
-      parallelRouteTransform:
-        pluginOptions.parallelRouteTransform ??
-        shouldParallelizeRouteTransforms(routeCount),
-      routeChunkCache,
-      splitRouteModules: Boolean(splitRouteModules),
-      isBuild,
-    });
+    const useRouteModuleTransformLoader = shouldUseRouteModuleTransformLoader(
+      pluginOptions.parallelRouteTransform
+    );
+    const routeTransformRunner: RouteTransformRunner = task =>
+      executeRouteTransformTask(task, { routeChunkCache });
     const routeChunkOptions = {
       splitRouteModules,
       rootRouteFile,
@@ -457,7 +423,6 @@ export const pluginReactRouter = (
       api,
       isBuild,
       lazyCompilationPrewarm: pluginOptions.unstableLazyCompilationPrewarm,
-      routeTransformExecutor,
       routeRestartMarkerPath,
       watchDirectory,
       getRouteTopology: routeTopology.getRouteTopology,
@@ -783,7 +748,6 @@ export const pluginReactRouter = (
         routeCount >= 256 &&
         (config.performance?.printFileSize === undefined ||
           config.performance.printFileSize === true);
-
       return mergeRsbuildConfig(config, {
         ...(shouldCompactFileSizeReport
           ? {
@@ -943,17 +907,34 @@ export const pluginReactRouter = (
         return mergeEnvironmentConfig(config, {
           tools: {
             rspack: rspackConfig => {
+              const environmentDevHmrEnabled =
+                name === 'web' &&
+                !isBuild &&
+                devHmrRefreshRuntimePath !== undefined &&
+                config.mode === 'development' &&
+                config.dev?.hmr !== false &&
+                isRspackSwcReactRefreshEnabled(rspackConfig);
+
+              if (useRouteModuleTransformLoader) {
+                registerRouteModuleTransformRules(rspackConfig, {
+                  environmentName: name,
+                  ssr,
+                  isBuild,
+                  isSpaMode,
+                  rootRoutePath,
+                  devHmr: environmentDevHmrEnabled,
+                  logPerformance,
+                  routeByFilePath,
+                  parallelRouteTransform: pluginOptions.parallelRouteTransform,
+                });
+              }
+
               if (pluginOptions.federation) {
                 ensureFederationAsyncStartup(rspackConfig);
               }
 
               if (name === 'web') {
-                devHmrEnabled =
-                  !isBuild &&
-                  devHmrRefreshRuntimePath !== undefined &&
-                  config.mode === 'development' &&
-                  config.dev?.hmr !== false &&
-                  isRspackSwcReactRefreshEnabled(rspackConfig);
+                devHmrEnabled = environmentDevHmrEnabled;
                 if (devHmrEnabled) {
                   devHdrSignal?.ensure();
                 }
@@ -1023,11 +1004,12 @@ export const pluginReactRouter = (
       appDirectory,
       getAssetPrefix: () => assetPrefix,
       routeChunkOptions,
-      routeTransformExecutor,
+      routeTransformRunner,
       routeByFilePath,
       routeChunkConfig,
       isBuild,
       splitRouteModules: Boolean(splitRouteModules),
+      useRouteModuleTransformApi: !useRouteModuleTransformLoader,
       ssr,
       isSpaMode,
       rootRoutePath,
