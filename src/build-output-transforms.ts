@@ -3,19 +3,77 @@ import jsesc from 'jsesc';
 import { relative } from 'pathe';
 import { PLUGIN_NAME } from './constants.js';
 import {
+  createReactRouterManifestOptions,
   getReactRouterManifestForDev,
+  type ReactRouterManifestForDev as ReactRouterManifest,
+  type RouteChunkManifestOptions,
+  type RouteModuleAnalysisProvider,
   type ReactRouterManifestStats,
 } from './manifest.js';
 import type { ReactRouterPerformanceProfiler } from './performance.js';
+import {
+  validateSpaModeRouteExports,
+  type RouteTransformRunner,
+} from './route-transform-tasks.js';
 import { createBundlerRouteExportResolver } from './route-export-resolution.js';
-import type { RouteChunkConfig } from './route-chunks.js';
-import type { RouteTransformRunner } from './route-transform-tasks.js';
+import {
+  getRouteChunkNameFromModuleId,
+  type RouteChunkConfig,
+} from './route-chunks.js';
 import type { PluginOptions, Route } from './types.js';
 import { isSourceMapEnabled } from './warnings/warn-on-client-source-maps.js';
+import {
+  analyzeRouteModuleCode,
+  type RouteModuleAnalysis,
+} from './export-utils.js';
+import {
+  relocateServerAssetsToClient,
+  type RelocatableAssetCompilation,
+} from './ssr-asset-relocation.js';
 
-type ReactRouterManifest = Awaited<
-  ReturnType<typeof getReactRouterManifestForDev>
->;
+/**
+ * Register the node-compilation hook that relocates server-only static assets
+ * (`?url` imports, `.css?url` files, and other `asset/resource` outputs
+ * referenced only by loaders or `.server` modules) into the client build. The
+ * loader/`links()` export returns the asset URL to the client, which fetches it
+ * from `build/client` at runtime, so the file must exist there even though only
+ * the node compilation referenced it. The assets are also stripped from the
+ * server build to avoid shipping duplicate static files, mirroring upstream
+ * React Router's Vite plugin. This runs for every node compilation, so it also
+ * covers `serverBundles` (multiple node outputs) and dev mode (where
+ * `writeToDisk` is enabled).
+ *
+ * Registered by both the classic build-output transforms and the RSC branch so
+ * `.css?url`/`?url` assets referenced from `links()` resolve in RSC framework
+ * mode too.
+ */
+export const registerSsrAssetRelocation = ({
+  api,
+  outputClientPath,
+  performanceProfiler,
+}: {
+  api: RsbuildPluginAPI;
+  outputClientPath: string;
+  performanceProfiler: ReactRouterPerformanceProfiler;
+}): void => {
+  const relocatedDestinations = new Map<string, string>();
+  api.processAssets(
+    { stage: 'report', targets: ['node'] },
+    async ({ compilation }) => {
+      await performanceProfiler.record(
+        'node',
+        'assets:relocate-ssr-only',
+        'ssr-only-assets',
+        () =>
+          relocateServerAssetsToClient({
+            compilation: compilation as unknown as RelocatableAssetCompilation,
+            outputClientPath,
+            relocatedDestinations,
+          })
+      );
+    }
+  );
+};
 
 type RegisterBuildOutputTransformsOptions = {
   api: RsbuildPluginAPI;
@@ -30,7 +88,8 @@ type RegisterBuildOutputTransformsOptions = {
   getClientStats: () => ReactRouterManifestStats | undefined;
   appDirectory: string;
   getAssetPrefix: () => string;
-  routeChunkOptions: Parameters<typeof getReactRouterManifestForDev>[5];
+  routeChunkOptions: RouteChunkManifestOptions | undefined;
+  routeModuleAnalysis?: RouteModuleAnalysisProvider;
   routeTransformRunner: RouteTransformRunner;
   routeByFilePath: Map<string, Route>;
   routeChunkConfig: RouteChunkConfig;
@@ -40,7 +99,12 @@ type RegisterBuildOutputTransformsOptions = {
   ssr: boolean;
   isSpaMode: boolean;
   rootRoutePath: string;
+  outputClientPath: string;
   isDevHmrEnabled?: () => boolean;
+  onRouteModuleAnalysis?: (
+    resourcePath: string,
+    analysis: RouteModuleAnalysis
+  ) => void;
 };
 
 export const registerBuildOutputTransforms = ({
@@ -55,6 +119,7 @@ export const registerBuildOutputTransforms = ({
   appDirectory,
   getAssetPrefix,
   routeChunkOptions,
+  routeModuleAnalysis,
   routeTransformRunner,
   routeByFilePath,
   routeChunkConfig,
@@ -64,10 +129,26 @@ export const registerBuildOutputTransforms = ({
   ssr,
   isSpaMode,
   rootRoutePath,
+  outputClientPath,
   isDevHmrEnabled = () => false,
+  onRouteModuleAnalysis,
 }: RegisterBuildOutputTransformsOptions): void => {
-  const transformRouteModule = async (args: Parameters<TransformHandler>[0]) =>
-    performanceProfiler.record(
+  const rememberRouteModuleAnalysis = (
+    args: Parameters<TransformHandler>[0]
+  ): void => {
+    if (!routeByFilePath.has(args.resourcePath)) {
+      return;
+    }
+    onRouteModuleAnalysis?.(
+      args.resourcePath,
+      analyzeRouteModuleCode(args.code)
+    );
+  };
+
+  const transformRouteModule = async (
+    args: Parameters<TransformHandler>[0]
+  ) => {
+    return performanceProfiler.record(
       args.environment?.name,
       'route:module',
       args.resource,
@@ -88,6 +169,7 @@ export const registerBuildOutputTransforms = ({
           devHmr: isDevHmrEnabled(),
         })
     );
+  };
 
   api.processAssets(
     { stage: 'additional', targets: ['node'] },
@@ -104,6 +186,8 @@ export const registerBuildOutputTransforms = ({
       }
     }
   );
+
+  registerSsrAssetRelocation({ api, outputClientPath, performanceProfiler });
 
   api.transform(
     {
@@ -137,7 +221,10 @@ export const registerBuildOutputTransforms = ({
               getClientStats(),
               appDirectory,
               getAssetPrefix(),
-              routeChunkOptions
+              createReactRouterManifestOptions({
+                routeChunks: routeChunkOptions,
+                routeModuleAnalysis,
+              })
             ));
           return {
             code: `export default ${jsesc(manifest, { es6: true })};`,
@@ -149,9 +236,11 @@ export const registerBuildOutputTransforms = ({
   api.transform(
     {
       resourceQuery: /__react-router-build-client-route/,
+      order: 'post',
     },
-    async args =>
-      performanceProfiler.record(
+    async args => {
+      rememberRouteModuleAnalysis(args);
+      return performanceProfiler.record(
         args.environment?.name,
         'route:client-entry',
         args.resource,
@@ -166,29 +255,67 @@ export const registerBuildOutputTransforms = ({
             routeId: routeByFilePath.get(args.resourcePath)?.id,
             devHmr: isDevHmrEnabled(),
           })
-      )
+      );
+    }
   );
 
   api.transform(
     {
       resourceQuery: /route-chunk=/,
       environments: ['web'],
+      order: 'post',
     },
-    async args =>
-      performanceProfiler.record(
+    async args => {
+      return performanceProfiler.record(
         args.environment?.name,
         'route:chunk',
         args.resource,
-        async () =>
-          routeTransformRunner({
+        async () => {
+          const routeChunkName = getRouteChunkNameFromModuleId(args.resource);
+          if (isBuild && isSpaMode && routeChunkName === 'main') {
+            validateSpaModeRouteExports({
+              exportNames: analyzeRouteModuleCode(args.code, args.resourcePath)
+                .exports,
+              resourcePath: args.resourcePath,
+              rootRoutePath,
+            });
+          }
+
+          const routeChunkArtifact = await routeTransformRunner({
             kind: 'routeChunk',
             code: args.code,
             resource: args.resource,
             resourcePath: args.resourcePath,
             isBuild,
             routeChunkConfig,
-          })
-      )
+          });
+
+          // Invariant with the transformRouteModule registration below: in
+          // split-chunk production builds, web route modules are transformed
+          // HERE (on the main chunk) and the shared registration is scoped to
+          // ['node']. If either gate changes, web modules get transformed
+          // twice or not at all.
+          if (!isBuild || routeChunkName !== 'main') {
+            return routeChunkArtifact;
+          }
+
+          return routeTransformRunner({
+            kind: 'routeModule',
+            code: routeChunkArtifact.code,
+            resource: args.resource,
+            resourcePath: args.resourcePath,
+            environmentName: 'web',
+            sourceMaps: isSourceMapEnabled(
+              args.environment.config.output.sourceMap
+            ),
+            ssr,
+            isBuild,
+            isSpaMode,
+            rootRoutePath,
+          });
+        }
+      );
+    }
   );
 
   if (isBuild && splitRouteModules) {
@@ -199,9 +326,10 @@ export const registerBuildOutputTransforms = ({
           not: /__react-router-build-client-route|react-router-route|route-chunk=/,
         },
         environments: ['web'],
+        order: 'post',
       },
-      async args =>
-        performanceProfiler.record(
+      async args => {
+        return performanceProfiler.record(
           args.environment?.name,
           'route:split-exports',
           args.resource,
@@ -212,7 +340,8 @@ export const registerBuildOutputTransforms = ({
               resourcePath: args.resourcePath,
               routeChunkConfig,
             })
-        )
+        );
+      }
     );
   }
 
@@ -274,6 +403,11 @@ export const registerBuildOutputTransforms = ({
         resourceQuery: {
           not: /__react-router-build-client-route|react-router-route|route-chunk=/,
         },
+        // Invariant with the route-chunk= handler above: when split-chunk
+        // production builds transform web modules on the main chunk, this
+        // registration must stay scoped to ['node'] so web modules are not
+        // transformed twice.
+        environments: isBuild && splitRouteModules ? ['node'] : undefined,
         order: 'post',
       },
       transformRouteModule
