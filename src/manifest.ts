@@ -13,6 +13,7 @@ import {
   createEmptyRouteChunkByExportName,
   detectRouteChunksIfEnabled,
   getRouteChunkEntryName,
+  getRouteEntryBaseName,
   routeChunkExportNames,
   validateRouteChunks,
   type RouteChunkCache,
@@ -412,36 +413,39 @@ export const getReactRouterManifestPath = ({
   return `${dir}/manifest-${version}.js`;
 };
 
-const getManifestVersion = (
-  fingerprintedValues: { entry: unknown; routes: unknown },
-  isBuild: boolean
-): string => {
-  if (!isBuild) {
-    return String(Math.random());
-  }
-  return createHash('md5')
+// The version is derived from the manifest content in every mode. React
+// Router's stale-client detection compares the version the browser loaded with
+// the one the server build was pinned to, and answers a mismatch with a
+// document reload. In development the browser manifest asset is served from
+// the latest web compilation while the server build stays pinned to the
+// compilation it was committed with, so a random per-compilation version made
+// the two disagree whenever a web compilation completed without changing the
+// manifest (for example the hot data revalidation recompile that follows a
+// server change), reloading the document for no reason. Equal content now
+// yields an equal version, and a real manifest change still busts the browser
+// cache through the `?v=` query on the development manifest URL.
+const getManifestVersion = (fingerprintedValues: {
+  entry: unknown;
+  routes: unknown;
+}): string =>
+  createHash('md5')
     .update(JSON.stringify(fingerprintedValues))
     .digest('hex')
     .slice(0, 8);
-};
-
-const getRouteEntryName = (route: Route): string => {
-  const extensionIndex = route.file.lastIndexOf('.');
-  return extensionIndex >= 0 ? route.file.slice(0, extensionIndex) : route.file;
-};
 
 export const getReactRouterManifestChunkNames = (
   routes: Record<string, Route>,
+  appDirectory: string,
   splitRouteModules: boolean | 'enforce' = false
 ): Set<string> => {
   const chunkNames = new Set<string>(['entry.client']);
   for (const route of Object.values(routes)) {
-    chunkNames.add(getRouteEntryName(route));
+    chunkNames.add(getRouteEntryBaseName(route, appDirectory));
     if (!splitRouteModules || route.id === 'root') {
       continue;
     }
     for (const exportName of routeChunkExportNames) {
-      chunkNames.add(getRouteChunkEntryName(route.id, exportName));
+      chunkNames.add(getRouteChunkEntryName(route, exportName, appDirectory));
     }
   }
   return chunkNames;
@@ -449,6 +453,7 @@ export const getReactRouterManifestChunkNames = (
 
 const createRouteManifestItem = ({
   route,
+  appDirectory,
   assetPrefix,
   jsAssets,
   routeAnalysis,
@@ -456,6 +461,7 @@ const createRouteManifestItem = ({
   getCssAssetsForChunk,
 }: {
   route: Route;
+  appDirectory: string;
   assetPrefix: string;
   jsAssets: string[];
   routeAnalysis: RouteManifestAnalysis;
@@ -465,13 +471,17 @@ const createRouteManifestItem = ({
   const routeChunkMap = routeAnalysis.hasRouteChunkByExportName;
   const chunkModulePath = (exportName: RouteChunkExportName) =>
     routeChunkMap?.[exportName]
-      ? getModulePathForChunk(getRouteChunkEntryName(route.id, exportName))
+      ? getModulePathForChunk(
+          getRouteChunkEntryName(route, exportName, appDirectory)
+        )
       : undefined;
   const cssAssets = [
     ...routeAnalysis.cssAssets,
     ...routeChunkExportNames.flatMap(exportName =>
       routeChunkMap?.[exportName]
-        ? getCssAssetsForChunk(getRouteChunkEntryName(route.id, exportName))
+        ? getCssAssetsForChunk(
+            getRouteChunkEntryName(route, exportName, appDirectory)
+          )
         : []
     ),
   ];
@@ -540,7 +550,7 @@ function generateReactRouterManifestForDevEffect(
       Object.entries(routes),
       ([key, route]) =>
         Effect.gen(function* () {
-          const routeEntryName = getRouteEntryName(route);
+          const routeEntryName = getRouteEntryBaseName(route, context);
           const { js: jsAssets, css: discoveredCssAssets } =
             getAssetsForChunk(routeEntryName);
           const routeFilePath = resolve(context, route.file);
@@ -571,6 +581,7 @@ function generateReactRouterManifestForDevEffect(
             key,
             createRouteManifestItem({
               route,
+              appDirectory: context,
               assetPrefix,
               jsAssets,
               routeAnalysis,
@@ -614,7 +625,7 @@ function generateReactRouterManifestForDevEffect(
       },
       routes: result,
     };
-    const version = getManifestVersion(fingerprintedValues, isBuild);
+    const version = getManifestVersion(fingerprintedValues);
     const manifestPath = getReactRouterManifestPath({
       version,
       isBuild,
