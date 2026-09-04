@@ -1,5 +1,14 @@
 # rsbuild-plugin-react-router
 
+## 0.6.5
+
+### Patch Changes
+
+- 93c1333: Hash the browser manifest version with sha256 instead of md5, which is
+  unavailable on FIPS-enabled machines and made builds fail there. The version
+  is a short content digest, so existing deployments only see the manifest file
+  name change once.
+
 ## 0.6.4
 
 ### Patch Changes
