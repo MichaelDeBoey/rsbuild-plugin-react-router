@@ -1,5 +1,14 @@
 # rsbuild-plugin-react-router
 
+## 0.6.3
+
+### Patch Changes
+
+- 97aae44: Resolve React Router 8.3's `future.unstable_enableNodeReadableStream` flag
+  (default `false`) so the resolved config handed to presets and `buildEnd`
+  matches the current `@react-router/dev` shape. The plugin ships its own server
+  entry, so the flag is passed through without changing plugin behavior.
+
 ## 0.6.2
 
 ### Patch Changes
