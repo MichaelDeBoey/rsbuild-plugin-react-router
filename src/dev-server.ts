@@ -1,7 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { pathToFileURL } from 'node:url';
 import type { RsbuildConfig } from '@rsbuild/core';
 import type { ServerBuild } from 'react-router';
 import { installDevServerSourceMapSupport } from './dev-source-maps.js';
+import { resolveAppPackagePath } from './plugin-utils.js';
 
 export type ServerSetup = Exclude<
   NonNullable<NonNullable<RsbuildConfig['server']>['setup']>,
@@ -18,6 +20,7 @@ type RequestHandler = (request: Request) => Response | Promise<Response>;
 type BuildProvider = () => Promise<ServerBuild>;
 
 export type DevServerMiddlewareDependencies = {
+  rootPath: string;
   loadBuild: BuildProvider;
   createRequestHandler?: (
     build: BuildProvider,
@@ -39,9 +42,22 @@ export const createDevServerMiddleware = (
 
   const getListener = () => {
     listenerPromise ??= (async () => {
-      const createRequestHandler =
-        dependencies.createRequestHandler ??
-        (await import('react-router')).createRequestHandler;
+      let createRequestHandler = dependencies.createRequestHandler;
+      if (!createRequestHandler) {
+        const reactRouterPath = resolveAppPackagePath(
+          'react-router',
+          dependencies.rootPath
+        );
+        if (!reactRouterPath) {
+          throw new Error('Cannot resolve react-router from the application.');
+        }
+        // Match the application's browser/server bundles, including when the
+        // plugin is linked from a workspace with a different Router version.
+        const routerModule: typeof import('react-router') = await import(
+          pathToFileURL(reactRouterPath).href
+        );
+        createRequestHandler = routerModule.createRequestHandler;
+      }
       const createRequestListener =
         dependencies.createRequestListener ??
         (await import('@remix-run/node-fetch-server')).createRequestListener;
@@ -73,8 +89,10 @@ export const createDevServerMiddleware = (
 
 export const createReactRouterDevServerSetup = ({
   loadBuild,
+  rootPath,
 }: {
   loadBuild: BuildProvider;
+  rootPath: string;
 }): ServerSetup =>
   function reactRouterDevServerSetup(context) {
     if (context.action !== 'dev') {
@@ -85,6 +103,8 @@ export const createReactRouterDevServerSetup = ({
     // request handler.
     return () => {
       installDevServerSourceMapSupport();
-      context.server.middlewares.use(createDevServerMiddleware({ loadBuild }));
+      context.server.middlewares.use(
+        createDevServerMiddleware({ loadBuild, rootPath })
+      );
     };
   };
