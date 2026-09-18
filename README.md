@@ -76,6 +76,13 @@ rsbuild.config.ts
 
 ## Configuration
 
+For server-only changes, `rsbuild build --environment node` can reuse the
+finalized browser manifest from a previous full build in the same project.
+Keep the browser output and build cache. Run a full build after changing routes
+or browser assets, or adding or removing a route's `loader` or `action` export.
+Node-only builds check the compiled exports against the cached manifest. If the
+manifest is missing or incompatible, the build fails and asks for a full build.
+
 React Router application settings live in `react-router.config.*`. The Rsbuild
 plugin only needs options for Rsbuild-specific behavior.
 
@@ -83,6 +90,7 @@ plugin only needs options for Rsbuild-specific behavior.
 
 ```ts
 pluginReactRouter({
+  typegen: true,
   customServer: false,
   lazyCompilation: true,
   unstableLazyCompilationPrewarm: false,
@@ -93,12 +101,13 @@ pluginReactRouter({
 
 | Option                           | Default     | Description                                                                                                                                                                                                                      |
 | -------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `typegen`                        | `true`      | Generates React Router route types during development and builds. Set to `false` when type generation is managed separately.                                                                                                     |
 | `customServer`                   | `false`     | Disables the built-in development SSR middleware. Enable this when an app owns the server with `createDevServer()` or an adapter.                                                                                                |
 | `serverOutput`                   | Derived     | Emitted Rsbuild server format: `'module'` or `'commonjs'`. When omitted, React Router's `serverModuleFormat` selects the format (`'esm'` -> `'module'`, `'cjs'` -> `'commonjs'`); setting `serverOutput` overrides it.           |
 | `lazyCompilation`                | `true`      | Optional Rsbuild dev lazy-compilation config. When enabled here or through `dev.lazyCompilation`, React Router hydration-critical modules stay eager so the browser manifest and route modules are not replaced by lazy proxies. |
 | `unstableLazyCompilationPrewarm` | `false`     | Experimental prewarm for emitted lazy-compilation proxy modules after dev compiles. Enable with `true` when route JS proxy startup should happen shortly after compiler readiness.                                               |
 | `logPerformance`                 | `false`     | Logs structured React Router plugin timing information.                                                                                                                                                                          |
-| `parallelRouteTransform`         | `undefined` | Controls worker-thread route transforms. `undefined` and `false` keep transforms inline, `true` uses an automatic worker count, and a positive integer sets the maximum worker count.                                             |
+| `parallelRouteTransform`         | `undefined` | Controls worker-thread route transforms. `undefined` and `false` keep transforms inline, `true` uses an automatic worker count, and a positive integer sets the maximum worker count.                                            |
 | `onRouteTopologyChange`          | `undefined` | Notification for programmatic/custom dev servers. Recreate the Rsbuild server when route files are added, removed, or moved. The callback is not awaited.                                                                        |
 | `federation`                     | `false`     | Enables the plugin's experimental Module Federation integration.                                                                                                                                                                 |
 

@@ -1,3 +1,10 @@
+import {
+  createReactRouterManifestSnapshot,
+  type ReactRouterManifestSnapshot,
+} from './manifest-snapshot.js';
+import { createReactRouterManifestState } from './manifest-state.js';
+import { registerNodeOnlyManifestValidation } from './node-only-manifest.js';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import fsExtra from 'fs-extra';
 import type { Config } from './react-router-config.js';
@@ -29,9 +36,7 @@ import {
   collectUnsupportedRscScriptAssets,
   configRoutesToRouteManifest,
   createReactRouterManifestStats,
-  type ReactRouterManifestForDev as ReactRouterManifest,
   type ReactRouterManifestStats,
-  type RouteManifestModuleExports,
 } from './manifest.js';
 import type { RouteModuleAnalysis } from './export-utils.js';
 import { registerModifyBrowserManifestAssets } from './modify-browser-manifest.js';
@@ -229,7 +234,8 @@ export const pluginReactRouter = (
       // `getNormalizedConfig({ environment: 'web' })` throws when the build was
       // narrowed to other environments (`--environment node`), so look the web
       // environment up on the root config instead.
-      const web = root.environments.web;
+      const web =
+        root.environments.web ?? api.getRsbuildConfig().environments?.web;
       assetPrefix = resolveEffectiveAssetPrefix(
         {
           dev: web?.dev,
@@ -295,10 +301,12 @@ export const pluginReactRouter = (
       buildEnd,
     } = resolvedConfig;
 
-    await registerReactRouterTypegen(api, {
-      runtime: effectRuntime,
-      appDirectory,
-    });
+    if (pluginOptions.typegen !== false) {
+      await registerReactRouterTypegen(api, {
+        runtime: effectRuntime,
+        appDirectory,
+      });
+    }
 
     const hasExplicitServerOutput = Object.prototype.hasOwnProperty.call(
       options,
@@ -525,11 +533,6 @@ export const pluginReactRouter = (
       routeRestartMarkerPath,
       onRouteTopologyChange: pluginOptions.onRouteTopologyChange,
     });
-    let latestBrowserManifest: ReactRouterManifest | null = null;
-    let latestBrowserManifestModuleExports: RouteManifestModuleExports = {};
-    let latestServerManifest: ReactRouterManifest | null = null;
-    const latestServerManifestsByBundleId: Record<string, ReactRouterManifest> =
-      {};
     // The node `server-manifest` module's source is a constant; its real
     // content is injected by a transform from the web compilation's emitted
     // asset names. Rspack's persistent cache would therefore reuse a previous
@@ -539,6 +542,10 @@ export const pluginReactRouter = (
     const serverManifestStampPath = resolve(
       api.context.cachePath,
       'react-router',
+      // Projects can share node_modules, and therefore Rsbuild's cache path.
+      createHash('sha256')
+        .update(JSON.stringify([appDirectory, outputClientPath]))
+        .digest('hex'),
       'server-manifest.json'
     );
     // Bundle manifests also depend on the route partition, which can change
@@ -546,14 +553,24 @@ export const pluginReactRouter = (
     // Only rewrite on change: a bumped mtime would otherwise invalidate the
     // module on every build and, if the cache dir is watched, rebuild node
     // after every web rebuild in dev.
-    const writeServerManifestStamp = (): void => {
+    const writeServerManifestStamp = (
+      snapshot: ReactRouterManifestSnapshot
+    ): void => {
       const stamp = JSON.stringify({
-        manifest: latestServerManifest,
-        bundles: latestServerManifestsByBundleId,
+        schema: 1,
+        isBuild,
+        appDirectory,
+        outputClientPath,
+        routes,
+        assetPrefix,
+        snapshot,
       });
-      const previous = existsSync(serverManifestStampPath)
-        ? readFileSync(serverManifestStampPath, 'utf8')
-        : undefined;
+      let previous: string | undefined;
+      try {
+        previous = readFileSync(serverManifestStampPath, 'utf8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
       if (stamp !== previous) {
         fsExtra.outputFileSync(serverManifestStampPath, stamp);
       }
@@ -736,65 +753,76 @@ export const pluginReactRouter = (
         onRouteTopologyChange: pluginOptions.onRouteTopologyChange,
       });
 
-    const stageLatestManifests = (
-      manifest: ReactRouterManifest,
-      sri: ReactRouterManifest['sri'],
-      moduleExportsByRouteId: RouteManifestModuleExports,
-      compilation: Rspack.Compilation
-    ) => {
-      performanceProfiler.recordSync(
-        'web',
-        'manifest:stage',
-        'virtual/react-router/browser-manifest',
-        () => {
-          latestBrowserManifest = manifest;
-          devBackgroundResources.setManifest(manifest);
-          latestBrowserManifestModuleExports = moduleExportsByRouteId;
-          const baseServerManifest = {
-            ...manifest,
-            sri,
-          };
-          latestServerManifest = baseServerManifest;
-          const manifestsByEntryName: Record<string, ReactRouterManifest> = {
-            [devServerBuildEntryName]: baseServerManifest,
-          };
-
-          if (modePlan.kind !== 'classic') {
-            return;
-          }
-
-          for (const { bundleId, entryName } of modePlan.artifacts
-            .serverBundleEntries) {
-            const bundleRoutes =
-              modePlan.artifacts.routesByServerBundleId[bundleId];
-            if (!bundleRoutes) {
-              continue;
-            }
-
-            const routeIds = new Set(Object.keys(bundleRoutes));
-            const filteredRoutes = Object.fromEntries(
-              Object.entries(manifest.routes).filter(([routeId]) =>
-                routeIds.has(routeId)
-              )
-            );
-            const bundleManifest = {
-              ...baseServerManifest,
-              routes: filteredRoutes,
-            };
-            latestServerManifestsByBundleId[bundleId] = bundleManifest;
-            manifestsByEntryName[entryName] = bundleManifest;
-          }
-          writeServerManifestStamp();
-
-          if (!isBuild) {
-            modePlan.artifacts.devRuntime.captureWeb(
-              compilation,
-              manifestsByEntryName
-            );
-          }
+    const manifestState = createReactRouterManifestState({
+      api,
+      isBuild,
+      onPublish: (compilation, snapshot) => {
+        writeServerManifestStamp(snapshot);
+        devBackgroundResources.setManifest(snapshot.browser);
+        if (!isBuild && modePlan.kind === 'classic') {
+          modePlan.artifacts.devRuntime.captureWeb(
+            compilation,
+            snapshot.serverByEntryName
+          );
         }
-      );
+      },
+    });
+
+    let persistedSnapshot: ReactRouterManifestSnapshot | null = null;
+    let persistedSnapshotError: Error | undefined;
+    // A separate node-only invocation has no browser compilation to publish a
+    // snapshot. Reuse finalized output from a compatible successful web build.
+    api.onBeforeCreateCompiler(() => {
+      if (
+        !isBuild ||
+        modePlan.kind !== 'classic' ||
+        api.getNormalizedConfig().environments.web
+      )
+        return;
+      const rebuildMessage = `[${PLUGIN_NAME}] Run a full build before building only the node environment; no compatible finalized browser manifest is available.`;
+      try {
+        const stamp = JSON.parse(readFileSync(serverManifestStampPath, 'utf8'));
+        if (
+          stamp.schema !== 1 ||
+          stamp.isBuild !== true ||
+          stamp.appDirectory !== appDirectory ||
+          stamp.outputClientPath !== outputClientPath ||
+          stamp.assetPrefix !== assetPrefix ||
+          JSON.stringify(stamp.routes) !== JSON.stringify(routes) ||
+          typeof stamp.snapshot?.server?.version !== 'string' ||
+          !stamp.snapshot?.serverByBundleId ||
+          !stamp.snapshot?.browser
+        ) {
+          throw new Error(rebuildMessage);
+        }
+        persistedSnapshot = createReactRouterManifestSnapshot({
+          manifest: stamp.snapshot.browser,
+          sri: stamp.snapshot.server.sri,
+          moduleExportsByRouteId: stamp.snapshot.moduleExportsByRouteId,
+          serverBuildPlan: {
+            defaultEntryName: devServerBuildEntryName,
+            serverBundleEntries: modePlan.artifacts.serverBundleEntries,
+          },
+          routesByServerBundleId: modePlan.artifacts.routesByServerBundleId,
+        });
+        // A node-only deployment can change server bundle partitions without
+        // changing browser assets; invalidate cached virtual modules too.
+        writeServerManifestStamp(persistedSnapshot);
+      } catch (cause) {
+        persistedSnapshotError = new Error(rebuildMessage, { cause });
+      }
+    });
+    const readManifestSnapshot = () => {
+      if (persistedSnapshotError) throw persistedSnapshotError;
+      return manifestState.read() ?? persistedSnapshot;
     };
+    if (isBuild && modePlan.kind === 'classic') {
+      registerNodeOnlyManifestValidation({
+        api,
+        routeByFilePath,
+        getSnapshot: () => persistedSnapshot,
+      });
+    }
 
     let clientStats: ReactRouterManifestStats | undefined;
     api.onAfterEnvironmentCompile(({ stats, environment }) => {
@@ -841,52 +869,58 @@ export const pluginReactRouter = (
     });
 
     if (modePlan.kind === 'classic') {
-      api.onAfterBuild(({ environments }) =>
-        effectRuntime.runPromise(
-          tryPluginPromise(() =>
-            runReactRouterPrerenderBuild({
-              api,
-              hasWebEnvironment: Boolean(environments.web),
-              buildDirectory,
-              serverBuildFile,
-              ssr,
-              isPrerenderEnabled,
-              prerenderConfig,
-              prerenderPaths: modePlan.artifacts.prerenderPaths,
-              basename,
-              future,
-              routes,
-              latestBrowserManifest,
-              latestBrowserManifestModuleExports,
-              clientStats,
-              pluginOptions,
-              appDirectory,
-              assetPrefix,
-              routeChunkOptions: modePlan.routeChunkOptions,
-              routeModuleAnalysis,
-              buildManifest: modePlan.artifacts.buildManifest,
-              buildEndReactRouterConfig,
-              buildEnd,
-            })
-          )
-        )
+      api.onAfterBuild(({ environments, stats }) =>
+        stats?.hasErrors()
+          ? undefined
+          : effectRuntime.runPromise(
+              tryPluginPromise(() =>
+                runReactRouterPrerenderBuild({
+                  api,
+                  hasWebEnvironment: Boolean(environments.web),
+                  buildDirectory,
+                  serverBuildFile,
+                  ssr,
+                  isPrerenderEnabled,
+                  prerenderConfig,
+                  prerenderPaths: modePlan.artifacts.prerenderPaths,
+                  basename,
+                  future,
+                  routes,
+                  latestBrowserManifest:
+                    readManifestSnapshot()?.browser ?? null,
+                  latestBrowserManifestModuleExports:
+                    readManifestSnapshot()?.moduleExportsByRouteId ?? {},
+                  clientStats,
+                  pluginOptions,
+                  appDirectory,
+                  assetPrefix,
+                  routeChunkOptions: modePlan.routeChunkOptions,
+                  routeModuleAnalysis,
+                  buildManifest: modePlan.artifacts.buildManifest,
+                  buildEndReactRouterConfig,
+                  buildEnd,
+                })
+              )
+            )
       );
     } else {
-      api.onAfterBuild(({ environments }) =>
-        effectRuntime.runPromise(
-          tryPluginPromise(() =>
-            runReactRouterRscPrerenderBuild({
-              api,
-              hasWebEnvironment: Boolean(environments.web),
-              buildDirectory,
-              serverBuildFile,
-              ssr,
-              prerenderConfig,
-              prerenderPaths: modePlan.prerenderPaths,
-              basename,
-            })
-          )
-        )
+      api.onAfterBuild(({ environments, stats }) =>
+        stats?.hasErrors()
+          ? undefined
+          : effectRuntime.runPromise(
+              tryPluginPromise(() =>
+                runReactRouterRscPrerenderBuild({
+                  api,
+                  hasWebEnvironment: Boolean(environments.web),
+                  buildDirectory,
+                  serverBuildFile,
+                  ssr,
+                  prerenderConfig,
+                  prerenderPaths: modePlan.prerenderPaths,
+                  basename,
+                })
+              )
+            )
       );
     }
 
@@ -1174,11 +1208,26 @@ export const pluginReactRouter = (
           manifestChunkNames,
           routeModuleAnalysis,
           onManifest: (manifest, sri, moduleExportsByRouteId, context) =>
-            stageLatestManifests(
-              manifest,
-              sri,
-              moduleExportsByRouteId,
-              context.compilation
+            performanceProfiler.recordSync(
+              'web',
+              'manifest:stage',
+              'virtual/react-router/browser-manifest',
+              () =>
+                manifestState.stage(
+                  context.compilation,
+                  createReactRouterManifestSnapshot({
+                    manifest,
+                    sri,
+                    moduleExportsByRouteId,
+                    serverBuildPlan: {
+                      defaultEntryName: devServerBuildEntryName,
+                      serverBundleEntries:
+                        modePlan.artifacts.serverBundleEntries,
+                    },
+                    routesByServerBundleId:
+                      modePlan.artifacts.routesByServerBundleId,
+                  })
+                )
             ),
         }
       );
@@ -1187,10 +1236,10 @@ export const pluginReactRouter = (
         api,
         resolvedServerOutput,
         performanceProfiler,
-        getLatestServerManifest: () => latestServerManifest,
+        getLatestServerManifest: () => readManifestSnapshot()?.server ?? null,
         serverManifestStampPath,
         getLatestServerManifestByBundleId: bundleId =>
-          latestServerManifestsByBundleId[bundleId],
+          readManifestSnapshot()?.serverByBundleId[bundleId],
         routes,
         pluginOptions,
         getClientStats: () => clientStats,
