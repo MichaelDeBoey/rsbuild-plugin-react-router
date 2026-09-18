@@ -1,5 +1,34 @@
 # rsbuild-plugin-react-router
 
+## 0.8.0
+
+### Minor Changes
+
+- 9222e1f: Add a `typegen` option to disable automatic route type generation when it is managed separately.
+- 3713893: Require Rsbuild 2.2.8 or newer and send hot data revalidation through its custom-event API. Replay the latest committed revision to reconnecting clients with `environment.hot.onConnect()`.
+
+  Remove the watched HDR revision file and the extra browser compilation it triggered. Keep pending revisions until hydration and browser hot updates finish, and ignore duplicate revisions.
+
+  Resolve the built-in development request handler from the application's React Router package so linked workspaces cannot mix server and browser data protocols during revalidation.
+
+  Update workspace Rsbuild and Rspack versions to 2.2.8 and 2.2.6, including the upstream loader-dependency and Watchpack performance fixes.
+
+### Patch Changes
+
+- 9222e1f: Include synchronous entrypoint JavaScript dependencies in production route manifest imports without preloading asynchronous child chunks or the entry itself. Preserve development preload behavior.
+- 9222e1f: Ignore erased TypeScript references when splitting route exports. Preserve runtime aliases, JSX dependencies, shared exported bindings, and legacy decorator metadata.
+
+  Keep an imported client loader's setup code in the same chunk as other exports that use that loader.
+
+- 9222e1f: Remove server-only route exports and imports from generated browser route chunks.
+- 9222e1f: Use configured browser filenames, final asset URLs, and subresource integrity in production manifests. Refresh development manifests when real content hashing is enabled. Keep route metadata tied to its compilation. Failed builds no longer expose stale server manifests, prerender pages, or run build-end hooks.
+
+  Reuse compatible browser manifests for separate node-only builds. Publish development snapshots only after successful compilation. Leave production placeholder chunks unchanged after computing their content hashes.
+
+  Reject node-only builds when a route adds or removes a `loader` or `action` export, including when modules come from the build cache. Preserve asset prefixes configured only on the web environment.
+
+  Store separate manifest snapshots for projects that share a `node_modules` directory so their builds cannot overwrite each other's snapshots.
+
 ## 0.7.3
 
 ### Patch Changes
