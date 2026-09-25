@@ -140,7 +140,10 @@ export const registerBuildOutputTransforms = ({
   const rememberRouteModuleAnalysis = (
     args: Parameters<TransformHandler>[0]
   ): void => {
-    if (!routeByFilePath.has(args.resourcePath)) {
+    if (
+      args.environment.name !== 'web' ||
+      !routeByFilePath.has(args.resourcePath)
+    ) {
       return;
     }
     onRouteModuleAnalysis?.(
@@ -195,7 +198,8 @@ export const registerBuildOutputTransforms = ({
 
   api.transform(
     {
-      test: /virtual\/react-router\/((browser|server)-manifest|server-build)/,
+      test: /virtual\/react-router\/(server-manifest|server-build)/,
+      environments: ['node'],
     },
     async args =>
       performanceProfiler.record(
@@ -203,12 +207,6 @@ export const registerBuildOutputTransforms = ({
         'manifest:transform',
         args.resource,
         async () => {
-          if (args.environment.name === 'web') {
-            return {
-              code: `window.__reactRouterManifest = "PLACEHOLDER";`,
-            };
-          }
-
           // Cache identity for a module whose source never changes (#136);
           // see `serverManifestStampPath` in index.ts.
           if (existsSync(serverManifestStampPath)) {
@@ -311,11 +309,8 @@ export const registerBuildOutputTransforms = ({
             routeChunkConfig,
           });
 
-          // Invariant with the transformRouteModule registration below: in
-          // split-chunk production builds, web route modules are transformed
-          // HERE (on the main chunk) and the shared registration is scoped to
-          // ['node']. If either gate changes, web modules get transformed
-          // twice or not at all.
+          // Main chunks need server-export pruning after chunk extraction;
+          // the shared route transform excludes all route-chunk requests.
           if (!isBuild || routeChunkName !== 'main') {
             return routeChunkArtifact;
           }
@@ -338,33 +333,6 @@ export const registerBuildOutputTransforms = ({
       );
     }
   );
-
-  if (isBuild && splitRouteModules) {
-    api.transform(
-      {
-        test: path => routeByFilePath.has(path),
-        resourceQuery: {
-          not: /__react-router-build-client-route|react-router-route|route-chunk=/,
-        },
-        environments: ['web'],
-        order: 'post',
-      },
-      async args => {
-        return performanceProfiler.record(
-          args.environment?.name,
-          'route:split-exports',
-          args.resource,
-          async () =>
-            routeTransformRunner({
-              kind: 'splitRouteExports',
-              code: args.code,
-              resourcePath: args.resourcePath,
-              routeChunkConfig,
-            })
-        );
-      }
-    );
-  }
 
   api.transform(
     {
@@ -409,29 +377,42 @@ export const registerBuildOutputTransforms = ({
       )
   );
 
-  if (useRouteModuleTransformApi) {
-    api.transform(
-      {
-        resourceQuery: /\?react-router-route/,
-        order: 'post',
-      },
-      transformRouteModule
-    );
-
+  if (useRouteModuleTransformApi || (isBuild && splitRouteModules)) {
+    // Explicit route queries and imports tagged after native resolution must
+    // select the same loader, so Rspack gives them one module identity.
     api.transform(
       {
         test: path => routeByFilePath.has(path),
         resourceQuery: {
-          not: /__react-router-build-client-route|react-router-route|route-chunk=/,
+          not: /__react-router-build-client-route|route-chunk=/,
         },
-        // Invariant with the route-chunk= handler above: when split-chunk
-        // production builds transform web modules on the main chunk, this
-        // registration must stay scoped to ['node'] so web modules are not
-        // transformed twice.
-        environments: isBuild && splitRouteModules ? ['node'] : undefined,
+        environments: useRouteModuleTransformApi ? undefined : ['web'],
         order: 'post',
       },
-      transformRouteModule
+      async args => {
+        if (
+          isBuild &&
+          splitRouteModules &&
+          args.environment.name === 'web' &&
+          args.resourceQuery !== '?react-router-route'
+        ) {
+          return performanceProfiler.record(
+            args.environment.name,
+            'route:split-exports',
+            args.resource,
+            () =>
+              routeTransformRunner({
+                kind: 'splitRouteExports',
+                code: args.code,
+                resourcePath: args.resourcePath,
+                routeChunkConfig,
+              })
+          );
+        }
+        return useRouteModuleTransformApi
+          ? transformRouteModule(args)
+          : { code: args.code };
+      }
     );
   }
 };

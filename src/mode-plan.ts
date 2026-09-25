@@ -285,7 +285,7 @@ const createClassicModePlan = async ({
     reactRouterConfig,
     routeConfig,
     routes,
-    rootDirectory: process.cwd(),
+    rootDirectory: api.context.rootPath,
     ssr,
     devHmr,
   });
@@ -302,10 +302,6 @@ const createClassicModePlan = async ({
       // `html: false` prevents rsbuild from emitting a stray entry.client.html
       // into build/client; React Router renders HTML itself.
       'entry.client': { import: finalEntryClientPath, html: false },
-      'virtual/react-router/browser-manifest': {
-        import: 'virtual/react-router/browser-manifest',
-        html: false,
-      },
       ...webRouteEntries,
     },
     nodeEntries: createReactRouterNodeEntries({
@@ -367,7 +363,7 @@ const createClassicModePlan = async ({
       ...(isBuild ? { mangleExports: 'size', usedExports: 'global' } : {}),
     },
     nodeExternals: Array.from(
-      new Set(['express', ...getSsrExternals(process.cwd())])
+      new Set(['express', ...getSsrExternals(api.context.rootPath)])
     ),
     nodeDependencies: shouldDependOnWebCompiler
       ? { dependencies: ['web'] }

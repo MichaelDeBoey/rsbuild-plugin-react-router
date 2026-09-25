@@ -8,11 +8,6 @@ import {
   registerModifyBrowserManifestAssets,
 } from '../src/modify-browser-manifest';
 
-const BROWSER_MANIFEST_PATH =
-  'static/js/virtual/react-router/browser-manifest.js';
-const PLACEHOLDER_MANIFEST_SOURCE =
-  'window.__reactRouterManifest="PLACEHOLDER";';
-
 const createTempApp = () => {
   const root = mkdtempSync(join(tmpdir(), 'rr-modify-manifest-'));
   const appDir = join(root, 'app');
@@ -63,9 +58,15 @@ type ProcessAssetsRegistration = {
 
 const createProcessAssetsHarness = () => {
   const registrations: ProcessAssetsRegistration[] = [];
+  let beforeCreateCompiler:
+    | ((context: { bundlerConfigs: Array<{ name?: string; output?: { clean?: boolean } }> }) => void)
+    | undefined;
 
   return {
     api: {
+      onBeforeCreateCompiler(handler: typeof beforeCreateCompiler) {
+        beforeCreateCompiler = handler;
+      },
       processAssets(
         processAssetsDescriptor: ProcessAssetsDescriptor,
         processAssetsHandler: ProcessAssetsHandler
@@ -79,6 +80,9 @@ const createProcessAssetsHarness = () => {
     getDescriptor: () => registrations[0]?.descriptor,
     getDescriptors: () =>
       registrations.map(registration => registration.descriptor),
+    beforeCreateCompiler(configs: Array<{ name?: string; output?: { clean?: boolean } }>) {
+      beforeCreateCompiler?.({ bundlerConfigs: configs });
+    },
     run(context: ProcessAssetsContext) {
       const registration = registrations[0];
       expect(registration).toBeDefined();
@@ -138,9 +142,13 @@ const createRoutesWithPage = () => ({
   },
 });
 
-const createBrowserManifestAssets = () => ({
-  [BROWSER_MANIFEST_PATH]: createAsset(PLACEHOLDER_MANIFEST_SOURCE),
-});
+const getEmittedManifestSource = (assets: Record<string, Asset>) => {
+  const asset = Object.entries(assets).find(([name]) =>
+    /manifest-[a-f0-9]{8}\.js$/.test(name)
+  );
+  expect(asset).toBeDefined();
+  return asset![1].source();
+};
 
 describe('modify browser manifest plugin', () => {
   it('uses official integrity metadata from stats and compilation assets', () => {
@@ -243,10 +251,10 @@ describe('modify browser manifest plugin', () => {
     });
   });
 
-  it('registers browser manifest mutation with Rsbuild processAssets', async () => {
+  it('emits a versioned browser manifest with Rsbuild processAssets', async () => {
     const { root, appDir } = createTempApp();
     const harness = createProcessAssetsHarness();
-    const assets = createBrowserManifestAssets();
+    const assets: Record<string, Asset> = {};
     const compilation = createCompilation(
       [
         ['entry.client', { files: new Set(['static/js/entry.client.js']) }],
@@ -269,13 +277,38 @@ describe('modify browser manifest plugin', () => {
       });
       await harness.run({ assets, compilation });
 
-      expect(assets[BROWSER_MANIFEST_PATH].source()).toContain('routes');
+      expect(getEmittedManifestSource(assets)).toContain('routes');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it('treats serialized browser manifest values as literal replacement text', async () => {
+  it('rejects per-rebuild cleanup of development browser manifests', () => {
+    const { root, appDir } = createTempApp();
+    const harness = createProcessAssetsHarness();
+    try {
+      registerModifyBrowserManifestAssets(
+        harness.api as never,
+        { root: rootRoute },
+        {},
+        appDir
+      );
+      expect(() =>
+        harness.beforeCreateCompiler([
+          { name: 'web', output: { clean: true } },
+        ])
+      ).toThrow('output.clean');
+      expect(() =>
+        harness.beforeCreateCompiler([
+          { name: 'web', output: { clean: false } },
+        ])
+      ).not.toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes special route IDs', async () => {
     const root = mkdtempSync(join(tmpdir(), 'rr-modify-manifest-'));
     const appDir = join(root, 'app');
     const routeFile = join(appDir, 'routes/dollar.tsx');
@@ -294,12 +327,7 @@ describe('modify browser manifest plugin', () => {
       `export default function Dollar() { return null; }`
     );
     const harness = createProcessAssetsHarness();
-    const suffix = ';window.afterPlaceholder=true;';
-    const assets = {
-      [BROWSER_MANIFEST_PATH]: createAsset(
-        `window.__reactRouterManifest="PLACEHOLDER"${suffix}`
-      ),
-    };
+    const assets: Record<string, Asset> = {};
     const compilation = createCompilation(
       [
         ['entry.client', { files: new Set(['static/js/entry.client.js']) }],
@@ -335,12 +363,11 @@ describe('modify browser manifest plugin', () => {
 
       await harness.run({ assets, compilation });
 
-      const source = assets[BROWSER_MANIFEST_PATH].source();
+      const source = getEmittedManifestSource(assets);
       for (const routeId of specialRouteIds) {
         expect(source).toContain(`'${routeId}'`);
       }
       expect(source).not.toContain('PLACEHOLDER');
-      expect(source.match(/window\.afterPlaceholder=true/g)).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -349,7 +376,7 @@ describe('modify browser manifest plugin', () => {
   it('reports the exact compilation that produced the manifest', async () => {
     const { root, appDir } = createTempApp();
     const harness = createProcessAssetsHarness();
-    const assets = createBrowserManifestAssets();
+    const assets: Record<string, Asset> = {};
     const compilation = createCompilation(
       [
         ['entry.client', { files: new Set(['static/js/entry.client.js']) }],
@@ -387,7 +414,6 @@ describe('modify browser manifest plugin', () => {
     const harness = createProcessAssetsHarness();
     const optimizedEntrySource = 'console.log("after optimize");';
     const assets = {
-      ...createBrowserManifestAssets(),
       'static/js/entry.client.js': createAsset(optimizedEntrySource),
       'static/js/root.js': createAsset('console.log("root");'),
     };
@@ -444,7 +470,6 @@ describe('modify browser manifest plugin', () => {
     const harness = createProcessAssetsHarness();
     const optimizedEntrySource = 'console.log("stable sri");';
     const assets = {
-      ...createBrowserManifestAssets(),
       'static/js/entry.client.js': createAsset(optimizedEntrySource),
     };
     const compilation = createCompilation(
@@ -476,7 +501,7 @@ describe('modify browser manifest plugin', () => {
       await harness.runStage('report', { assets, compilation });
 
       expect(reportedSri?.['/static/js/entry.client.js']).toMatch(/^sha384-/);
-      expect(assets[BROWSER_MANIFEST_PATH].source()).not.toContain("'sri'");
+      expect(getEmittedManifestSource(assets)).not.toContain("'sri'");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -485,7 +510,7 @@ describe('modify browser manifest plugin', () => {
   it('builds the manifest at the report stage from post-realContentHash asset names', async () => {
     const { root, appDir } = createTempApp();
     const harness = createProcessAssetsHarness();
-    const assets = createBrowserManifestAssets();
+    const assets: Record<string, Asset> = {};
     // Emulate Rspack's realContentHash rename: the entry chunk exposes its final
     // (post-rename) CSS/JS file names by the time PROCESS_ASSETS_STAGE_REPORT
     // runs. Reading them earlier (at `additions`) would capture the pre-rename
@@ -580,7 +605,7 @@ describe('modify browser manifest plugin', () => {
   it('does not read ignored chunk files while creating manifest stats', async () => {
     const { root, appDir } = createTempApp();
     const harness = createProcessAssetsHarness();
-    const assets = createBrowserManifestAssets();
+    const assets: Record<string, Asset> = {};
     const ignoredChunk = {};
     Object.defineProperty(ignoredChunk, 'files', {
       get() {
@@ -613,7 +638,7 @@ describe('modify browser manifest plugin', () => {
   it('uses actual manifest chunk names instead of theoretical split route chunks', async () => {
     const { root, appDir } = createTempApp();
     const harness = createProcessAssetsHarness();
-    const assets = createBrowserManifestAssets();
+    const assets: Record<string, Asset> = {};
     const theoreticalSplitChunk = {};
     Object.defineProperty(theoreticalSplitChunk, 'files', {
       get() {
@@ -655,7 +680,7 @@ describe('modify browser manifest plugin', () => {
   it('adds transitive entrypoint assets to the manifest', async () => {
     const { root, appDir } = createTempApp();
     const harness = createProcessAssetsHarness();
-    const assets = createBrowserManifestAssets();
+    const assets: Record<string, Asset> = {};
     let manifest: unknown;
 
     try {

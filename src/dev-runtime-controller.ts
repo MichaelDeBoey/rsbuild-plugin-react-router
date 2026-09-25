@@ -25,6 +25,7 @@ import { DEV_MANIFEST_UPDATE_EVENT } from './dev-hmr.js';
 import {
   getEnvironmentStats,
   snapshotDevChangedFiles,
+  type DevChangedFiles,
   type DevGraphIdentity,
   type DevRuntimeStats,
   type ReactRouterDevBuildPlan,
@@ -60,8 +61,6 @@ type CreateControllerOptions = {
   clientPatchesRouteMetadata?: boolean | (() => boolean);
 };
 
-const CSS_SOURCE_RELOAD_DELAY_MS = 1000;
-
 const isCssSourceFile = (file: string): boolean =>
   /\.css(?:\.[cm]?[jt]s)?$/.test(file);
 
@@ -85,33 +84,12 @@ export const createReactRouterDevRuntimeController = ({
     };
   }
 
-  let scheduledCssAssetOwnershipReload:
-    | ReturnType<typeof setTimeout>
-    | undefined;
-  let lastCssAssetOwnershipReloadAt = 0;
-  let reloadAfterCssAssetOwnershipRemoval = false;
-
   const sendCssAssetOwnershipReload = (): void => {
     const binding = sessions.getActiveBinding();
     if (!binding) {
       return;
     }
-    lastCssAssetOwnershipReloadAt = Date.now();
     binding.server.sockWrite('full-reload', { path: '*' });
-  };
-
-  const scheduleCssAssetOwnershipReload = (): void => {
-    if (scheduledCssAssetOwnershipReload) {
-      clearTimeout(scheduledCssAssetOwnershipReload);
-    }
-    const scheduledAt = Date.now();
-    scheduledCssAssetOwnershipReload = setTimeout(() => {
-      scheduledCssAssetOwnershipReload = undefined;
-      if (lastCssAssetOwnershipReloadAt > scheduledAt) {
-        return;
-      }
-      sendCssAssetOwnershipReload();
-    }, CSS_SOURCE_RELOAD_DELAY_MS);
   };
 
   const hdrChannels = new WeakMap<
@@ -126,13 +104,10 @@ export const createReactRouterDevRuntimeController = ({
   const closeBinding = (binding: RuntimeBinding, error?: Error): void => {
     hdrChannels.get(binding)?.close();
     hdrChannels.delete(binding);
-    if (scheduledCssAssetOwnershipReload) {
-      clearTimeout(scheduledCssAssetOwnershipReload);
-      scheduledCssAssetOwnershipReload = undefined;
-    }
-    reloadAfterCssAssetOwnershipRemoval = false;
     const pair = binding.compilers;
     if (pair) {
+      pendingChangesByCompiler.delete(pair.web);
+      pendingChangesByCompiler.delete(pair.node);
       resetDevCompilerPair(pair);
     }
     binding.compilers = undefined;
@@ -149,6 +124,29 @@ export const createReactRouterDevRuntimeController = ({
     DevCompilerPair,
     ReturnType<typeof createDevHdrIntentTracker>
   >();
+
+  // A retry may report no files even though an earlier uncommitted build had edits.
+  const pendingChangesByCompiler = new WeakMap<
+    Rspack.Compiler,
+    DevChangedFiles
+  >();
+  const changesByCompilation = new WeakMap<
+    Rspack.Compilation,
+    DevChangedFiles
+  >();
+  const captureCompilationChanges = (
+    compilation: Rspack.Compilation
+  ): DevChangedFiles => {
+    const changes = snapshotDevChangedFiles(compilation.compiler);
+    const pendingChanges = pendingChangesByCompiler.get(compilation.compiler);
+    const accumulatedChanges = {
+      known: changes.known && (pendingChanges?.known ?? true),
+      files: new Set([...(pendingChanges?.files ?? []), ...changes.files]),
+    };
+    pendingChangesByCompiler.set(compilation.compiler, accumulatedChanges);
+    changesByCompilation.set(compilation, accumulatedChanges);
+    return changes;
+  };
 
   const finishRuntimeAttempt = async (
     binding: RuntimeBinding,
@@ -169,6 +167,18 @@ export const createReactRouterDevRuntimeController = ({
       if (result === 'retry-node') {
         pair.node.watching?.invalidate();
         return;
+      }
+      if (result === 'committed') {
+        for (const side of ['web', 'node'] as const) {
+          const compilation = getEnvironmentStats(stats, side)?.compilation;
+          if (
+            compilation &&
+            pendingChangesByCompiler.get(compilation.compiler) ===
+              changesByCompilation.get(compilation)
+          ) {
+            pendingChangesByCompiler.delete(compilation.compiler);
+          }
+        }
       }
       const nodeCompilation = getEnvironmentStats(stats, 'node')?.compilation;
       if (
@@ -270,11 +280,10 @@ export const createReactRouterDevRuntimeController = ({
             html: escapeHtml(error.message),
           });
         },
-        onCssAssetOwnershipChanged(change) {
+        onCssAssetOwnershipChanged() {
           if (sessions.getActiveBinding()?.runtime !== runtime) {
             return;
           }
-          reloadAfterCssAssetOwnershipRemoval = change === 'removed';
           sendCssAssetOwnershipReload();
         },
         onRouteManifestChanged(manifest) {
@@ -374,10 +383,6 @@ export const createReactRouterDevRuntimeController = ({
         if (markDevCompilerPending(pair, side)) {
           runtime.beginAttempt();
         }
-        if (side === 'latestWebStart' && reloadAfterCssAssetOwnershipRemoval) {
-          reloadAfterCssAssetOwnershipRemoval = false;
-          scheduleCssAssetOwnershipReload();
-        }
       }
     };
     web.hooks.invalid.tap(`${PLUGIN_NAME}:dev-web-invalid`, () =>
@@ -410,6 +415,7 @@ export const createReactRouterDevRuntimeController = ({
       `${PLUGIN_NAME}:dev-web-compilation`,
       compilation => {
         if (sessions.getActiveBinding()?.id === sessionId) {
+          captureCompilationChanges(compilation);
           if (pair.currentAttemptIdentity) {
             compilationIdentities.setAttemptIdentityForCompilation(
               compilation,
@@ -420,10 +426,6 @@ export const createReactRouterDevRuntimeController = ({
             status: 'started',
             identity: getCompilationIdentity(compilation),
           };
-          if (reloadAfterCssAssetOwnershipRemoval) {
-            reloadAfterCssAssetOwnershipRemoval = false;
-            scheduleCssAssetOwnershipReload();
-          }
         }
       }
     );
@@ -433,7 +435,7 @@ export const createReactRouterDevRuntimeController = ({
         if (sessions.getActiveBinding()?.id !== sessionId) {
           return;
         }
-        const changes = snapshotDevChangedFiles(pair.node);
+        const changes = captureCompilationChanges(compilation);
         hdrIntents.capture(
           compilation,
           changes.known &&
@@ -509,8 +511,12 @@ export const createReactRouterDevRuntimeController = ({
       return;
     }
     const changes = {
-      web: snapshotDevChangedFiles(pair.web),
-      node: snapshotDevChangedFiles(pair.node),
+      web:
+        (webStats && changesByCompilation.get(webStats.compilation)) ??
+        snapshotDevChangedFiles(pair.web),
+      node:
+        (nodeStats && changesByCompilation.get(nodeStats.compilation)) ??
+        snapshotDevChangedFiles(pair.node),
     };
     const webAttempt = webStats
       ? compilationIdentities.getAttemptIdentityForCompilation(

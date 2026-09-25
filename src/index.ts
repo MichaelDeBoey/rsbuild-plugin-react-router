@@ -13,7 +13,11 @@ import { rspack, type RsbuildPlugin, type Rspack } from '@rsbuild/core';
 import { relative, resolve } from 'pathe';
 
 import { getDefaultConcurrency } from './concurrency.js';
-import { JS_EXTENSIONS, PLUGIN_NAME } from './constants.js';
+import {
+  BUILD_CLIENT_ROUTE_QUERY_STRING,
+  JS_EXTENSIONS,
+  PLUGIN_NAME,
+} from './constants.js';
 import { guardReactRouterLazyCompilation } from './lazy-compilation.js';
 import {
   findEntryFile,
@@ -90,7 +94,10 @@ import {
   setupReactRouterRscPlugin,
 } from './rsc-support.js';
 import { createReactRouterModePlan } from './mode-plan.js';
-import { createQuerylessRouteImportPlugin } from './route-imports.js';
+import {
+  createQuerylessRouteImportPlugin,
+  createRouteFilePathMap,
+} from './route-imports.js';
 import { registerDevServerSourceMaps } from './dev-source-maps.js';
 
 export type { Config as ReactRouterRsbuildConfig } from './react-router-config.js';
@@ -245,12 +252,15 @@ export const pluginReactRouter = (
       );
     });
 
-    const configPath = findEntryFile(resolve('react-router.config'));
+    const rootDirectory = api.context.rootPath;
+    const configPath = findEntryFile(
+      resolve(rootDirectory, 'react-router.config')
+    );
     const configExists = existsSync(configPath);
     let configWatchPaths: string | string[] = configExists
       ? configPath
       : JS_EXTENSIONS.map(extension =>
-          resolve(`react-router.config${extension}`)
+          resolve(rootDirectory, `react-router.config${extension}`)
         );
     let reactRouterUserConfig: Config = {};
     if (!configExists) {
@@ -258,7 +268,7 @@ export const pluginReactRouter = (
         'No react-router.config found, using default configuration.'
       );
     } else {
-      const displayPath = relative(process.cwd(), configPath);
+      const displayPath = relative(rootDirectory, configPath);
       try {
         const { value: imported, watchPaths } =
           await importConfigWithWatchPaths<Config>(configPath);
@@ -280,13 +290,13 @@ export const pluginReactRouter = (
       presets: configPresets,
       hasConfiguredServerModuleFormat,
     } = await effectRuntime.runPromise(
-      resolveReactRouterConfigEffect(reactRouterUserConfig)
+      resolveReactRouterConfigEffect(reactRouterUserConfig, rootDirectory)
     );
 
     const {
-      appDirectory,
+      appDirectory: configuredAppDirectory,
       basename,
-      buildDirectory,
+      buildDirectory: configuredBuildDirectory,
       future,
       allowedActionOrigins,
       routeDiscovery: userRouteDiscovery,
@@ -299,6 +309,8 @@ export const pluginReactRouter = (
       subResourceIntegrity,
       buildEnd,
     } = resolvedConfig;
+    const appDirectory = resolve(rootDirectory, configuredAppDirectory);
+    const buildDirectory = resolve(rootDirectory, configuredBuildDirectory);
 
     if (pluginOptions.typegen !== false) {
       await registerReactRouterTypegen(api, {
@@ -355,7 +367,7 @@ export const pluginReactRouter = (
     const routesPath = findEntryFile(resolve(appDirectory, 'routes'));
     if (!existsSync(routesPath)) {
       const missingRoutesPath = relative(
-        process.cwd(),
+        rootDirectory,
         resolve(appDirectory, 'routes.ts')
       );
       throw new Error(`Route config file not found at "${missingRoutesPath}".`);
@@ -427,7 +439,8 @@ export const pluginReactRouter = (
     if (isRscMode) {
       assertReactRouterRscSupport({
         pluginName: PLUGIN_NAME,
-        resolvePackagePath: resolveAppPackagePath,
+        resolvePackagePath: specifier =>
+          resolveAppPackagePath(specifier, rootDirectory),
       });
       assertReactRouterRscConfigSupport({
         pluginName: PLUGIN_NAME,
@@ -514,16 +527,26 @@ export const pluginReactRouter = (
       string,
       RouteModuleAnalysis
     >();
+    const routeClientModules = new Map<string, Rspack.Module>();
     const rememberRouteModuleAnalysis = (
       resourcePath: string,
       analysis: RouteModuleAnalysis
     ) => {
+      const module = routeClientModules.get(resourcePath);
+      if (module) module.buildInfo.reactRouterRouteAnalysis = analysis;
       transformedRouteModuleAnalyses.set(resolve(resourcePath), analysis);
+      const route = routeByFilePath.get(resolve(resourcePath));
+      if (route) {
+        transformedRouteModuleAnalyses.set(
+          resolve(appDirectory, route.file),
+          analysis
+        );
+      }
     };
     const routeModuleAnalysis = async (routeFilePath: string) =>
       transformedRouteModuleAnalyses.get(resolve(routeFilePath));
     const outputClientPath = resolve(buildDirectory, 'client');
-    const assetsBuildDirectory = relative(process.cwd(), outputClientPath);
+    const assetsBuildDirectory = relative(rootDirectory, outputClientPath);
     const watchDirectory = resolve(appDirectory);
     const routeRestartMarkerPath = getRouteRestartMarkerPath(appDirectory);
     const routeWatchFiles = createReactRouterRouteWatchFiles({
@@ -575,12 +598,7 @@ export const pluginReactRouter = (
       }
     };
 
-    const routeByFilePath = new Map(
-      Object.values(routes).map(route => [
-        resolve(appDirectory, route.file),
-        route,
-      ])
-    );
+    const routeByFilePath = createRouteFilePathMap(appDirectory, routes);
     const allowedActionOriginsForBuild =
       allowedActionOrigins === false ? undefined : allowedActionOrigins;
 
@@ -683,8 +701,15 @@ export const pluginReactRouter = (
     let sendRscDevUpdate: (() => void) | undefined;
     let scheduledRscDevUpdate: ReturnType<typeof setTimeout> | undefined;
     let hasPendingRscNodeUpdate = false;
-    let pendingRscNodeFiles = new Set<string>();
+    const unreadyRscEnvironments = new Set<string>();
     if (isRscMode && !isBuild) {
+      const markRscEnvironmentPending = (name: string) => {
+        unreadyRscEnvironments.add(name);
+        if (scheduledRscDevUpdate) {
+          clearTimeout(scheduledRscDevUpdate);
+          scheduledRscDevUpdate = undefined;
+        }
+      };
       api.onBeforeStartDevServer(({ server }) => {
         sendRscDevUpdate = () =>
           server.sockWrite('custom', {
@@ -698,16 +723,36 @@ export const pluginReactRouter = (
           scheduledRscDevUpdate = undefined;
         }
         hasPendingRscNodeUpdate = false;
-        pendingRscNodeFiles.clear();
+        unreadyRscEnvironments.clear();
         sendRscDevUpdate = undefined;
       });
-      api.onAfterEnvironmentCompile(({ environment, stats }) => {
-        if (
-          (environment.name !== 'node' && environment.name !== 'web') ||
-          stats?.hasErrors()
-        ) {
+      api.onBeforeEnvironmentCompile(({ environment }) => {
+        if (environment.name !== 'node' && environment.name !== 'web') {
           return;
         }
+        markRscEnvironmentPending(environment.name);
+      });
+      api.onAfterCreateCompiler(({ compiler }) => {
+        const compilers =
+          'compilers' in compiler ? compiler.compilers : [compiler];
+        for (const child of compilers) {
+          const name = child.options.name;
+          if (name === 'node' || name === 'web') {
+            child.hooks.invalid.tap(PLUGIN_NAME, () =>
+              markRscEnvironmentPending(name)
+            );
+          }
+        }
+      });
+      api.onAfterEnvironmentCompile(({ environment, stats }) => {
+        if (environment.name !== 'node' && environment.name !== 'web') {
+          return;
+        }
+        if (!stats || stats.hasErrors()) {
+          markRscEnvironmentPending(environment.name);
+          return;
+        }
+        unreadyRscEnvironments.delete(environment.name);
         if (environment.name === 'node') {
           const compiler = stats?.compilation.compiler;
           const changedFiles = new Set([
@@ -717,13 +762,16 @@ export const pluginReactRouter = (
           // Initial and lazy compilations do not represent source edits. Sending
           // an RSC revalidation for them can race and abort the navigation that
           // requested the lazy module.
-          if (changedFiles.size === 0) {
-            return;
+          if (
+            [...changedFiles].some(file => routeByFilePath.has(resolve(file)))
+          ) {
+            // Route HMR revalidates the current server build, including prior edits.
+            hasPendingRscNodeUpdate = false;
+          } else if ([...changedFiles].some(file => !isRscClientModule(file))) {
+            hasPendingRscNodeUpdate = true;
           }
-          hasPendingRscNodeUpdate = true;
-          pendingRscNodeFiles = changedFiles;
         }
-        if (!hasPendingRscNodeUpdate) {
+        if (!hasPendingRscNodeUpdate || unreadyRscEnvironments.size > 0) {
           return;
         }
         if (scheduledRscDevUpdate) {
@@ -731,15 +779,8 @@ export const pluginReactRouter = (
         }
         scheduledRscDevUpdate = setTimeout(() => {
           scheduledRscDevUpdate = undefined;
-          hasPendingRscNodeUpdate = false;
-          const clientHotUpdateHandlesChange =
-            pendingRscNodeFiles.size > 0 &&
-            [...pendingRscNodeFiles].every(isRscClientModule);
-          const routeHotUpdateHandlesChange = [...pendingRscNodeFiles].some(
-            filePath => routeByFilePath.has(resolve(filePath))
-          );
-          pendingRscNodeFiles.clear();
-          if (!clientHotUpdateHandlesChange && !routeHotUpdateHandlesChange) {
+          if (hasPendingRscNodeUpdate) {
+            hasPendingRscNodeUpdate = false;
             sendRscDevUpdate?.();
           }
         }, 1000);
@@ -1201,6 +1242,39 @@ export const pluginReactRouter = (
         performanceProfiler,
       });
     } else {
+      // Loader side effects do not run on persistent-cache hits. Keep compiled
+      // route facts in Rspack's cached module metadata, then restore the exact
+      // compilation's facts before manifest generation (and concatenation).
+      api.onAfterCreateCompiler(({ compiler }) => {
+        const compilers =
+          'compilers' in compiler ? compiler.compilers : [compiler];
+        for (const child of compilers) {
+          if (child.options.name !== 'web') continue;
+          child.hooks.thisCompilation.tap(PLUGIN_NAME, compilation => {
+            routeClientModules.clear();
+            rspack.NormalModule.getCompilationHooks(compilation).loader.tap(
+              PLUGIN_NAME,
+              (loader, module) => {
+                if (loader.resourceQuery === BUILD_CLIENT_ROUTE_QUERY_STRING) {
+                  routeClientModules.set(loader.resourcePath, module);
+                }
+              }
+            );
+            compilation.hooks.finishModules.tap(PLUGIN_NAME, modules => {
+              transformedRouteModuleAnalyses.clear();
+              for (const module of modules) {
+                const analysis = module.buildInfo.reactRouterRouteAnalysis as
+                  | RouteModuleAnalysis
+                  | undefined;
+                const resource = (module as Rspack.NormalModule).resource;
+                if (analysis && resource) {
+                  rememberRouteModuleAnalysis(resource.split('?')[0], analysis);
+                }
+              }
+            });
+          });
+        }
+      });
       registerModifyBrowserManifestAssets(
         api,
         routes,

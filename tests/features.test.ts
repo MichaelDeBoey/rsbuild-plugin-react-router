@@ -157,23 +157,20 @@ describe('pluginReactRouter', () => {
         path.join(compiler.context, getVirtualModuleFilePath(id));
 
       expect(virtualFilePaths).toContain(
-        virtualModulePath('virtual/react-router/browser-manifest')
-      );
-      expect(virtualFilePaths).toContain(
         virtualModulePath('virtual/react-router/server-build')
       );
       expect(virtualFilePaths).toContain(
         virtualModulePath('virtual/react-router/with-props')
       );
       expect(virtualFilePaths).not.toContain(
-        '/virtual/project/virtual/react-router/browser-manifest'
+        '/virtual/project/virtual/react-router/server-build'
       );
     });
 
     it('should map bare React Router virtual module ids to resolvable files', () => {
       expect(
-        getVirtualModuleFilePath('virtual/react-router/browser-manifest')
-      ).toBe('node_modules/virtual/react-router/browser-manifest.js');
+        getVirtualModuleFilePath('virtual/react-router/server-build')
+      ).toBe('node_modules/virtual/react-router/server-build.js');
       expect(
         getVirtualModuleFilePath('virtual/react-router/server-build-edge')
       ).toBe('node_modules/virtual/react-router/server-build-edge.js');
@@ -239,19 +236,17 @@ describe('pluginReactRouter', () => {
         )
       ).toBe(true);
 
-      const splitRouteExportsTransform = calls.find(
+      const routeTransforms = calls.filter(
         (call: any) =>
           typeof call.test === 'function' &&
-          call.resourceQuery?.not?.toString().includes('route-chunk=') &&
-          call.environments?.includes('web')
+          call.resourceQuery?.not?.toString().includes('route-chunk=')
       );
-      expect(splitRouteExportsTransform).toBeDefined();
-      expect(
-        splitRouteExportsTransform.test(path.resolve('app/routes/index.tsx'))
-      ).toBe(true);
-      expect(splitRouteExportsTransform.test(path.resolve('app/other.tsx'))).toBe(
-        false
-      );
+      expect(routeTransforms).toHaveLength(1);
+      const [routeTransform] = routeTransforms;
+      expect(routeTransform.test(path.resolve('app/routes/index.tsx'))).toBe(true);
+      expect(routeTransform.test(path.resolve('app/other.tsx'))).toBe(false);
+      expect(routeTransform.resourceQuery.not.test('')).toBe(false);
+      expect(routeTransform.resourceQuery.not.test('?react-router-route')).toBe(false);
 
       expect(
         calls.some(

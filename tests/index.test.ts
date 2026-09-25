@@ -11,6 +11,7 @@ import {
   pluginReactRouterRSC,
   shouldParallelizeEnvironmentBuilds,
 } from '../src';
+import { DEV_HMR_RUNTIME_MODULE_ID } from '../src/dev-hmr';
 import { getVirtualModuleFilePath } from '../src/virtual-modules';
 
 type ReactRouterTestGlobal = typeof globalThis & {
@@ -99,6 +100,22 @@ describe('pluginReactRouter', () => {
     });
   });
 
+  it('checks RSC support in the target project rather than the caller project', async () => {
+    const directory = fs.mkdtempSync(join(tmpdir(), 'rr-rsc-project-version-'));
+    try {
+      const packageDirectory = join(directory, 'node_modules/react-router');
+      fs.mkdirSync(packageDirectory, { recursive: true });
+      fs.writeFileSync(join(packageDirectory, 'package.json'), JSON.stringify({name: 'react-router', version: '7.0.0'}));
+      const rsbuild = await createStubRsbuild({ rsbuildConfig: {} });
+      rsbuild.context.rootPath = directory;
+      rsbuild.addPlugins([pluginReactRouterRSC({typegen: false})]);
+
+      await expect(rsbuild.unwrapConfig()).rejects.toThrow('requires react-router >=7.18.0 or >=8.0.0');
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('preserves an explicit writeToDisk override', async () => {
     const rsbuild = await createStubRsbuild({
       rsbuildConfig: {
@@ -137,7 +154,6 @@ describe('pluginReactRouter', () => {
     ).toBeUndefined();
     expect(buildRsbuild.onBeforeDevCompile).not.toHaveBeenCalled();
     expect(buildRsbuild.onAfterDevCompile).not.toHaveBeenCalled();
-    expect(buildRsbuild.onAfterCreateCompiler).not.toHaveBeenCalled();
   });
 
   it('should restart the dev server when route entries are added', async () => {
@@ -591,7 +607,7 @@ describe('pluginReactRouter', () => {
       await rsbuild.unwrapConfig();
 
       const beforeStartDevServer =
-        rsbuild.onBeforeStartDevServer.mock.calls[0][0];
+        rsbuild.onBeforeStartDevServer.mock.calls[1][0];
       const afterRscEnvironmentCompile =
         rsbuild.onAfterEnvironmentCompile.mock.calls[1][0];
       beforeStartDevServer({ server: { sockWrite } });
@@ -633,7 +649,7 @@ describe('pluginReactRouter', () => {
       await rsbuild.unwrapConfig();
 
       const beforeStartDevServer =
-        rsbuild.onBeforeStartDevServer.mock.calls[0][0];
+        rsbuild.onBeforeStartDevServer.mock.calls[1][0];
       const afterRscEnvironmentCompile =
         rsbuild.onAfterEnvironmentCompile.mock.calls[1][0];
       beforeStartDevServer({ server: { sockWrite } });
@@ -923,7 +939,7 @@ describe('pluginReactRouter', () => {
     ).toBe(true);
     expect(
       test({
-        resource: 'virtual/react-router/browser-manifest',
+        resource: DEV_HMR_RUNTIME_MODULE_ID,
       })
     ).toBe(false);
   });
@@ -1026,10 +1042,9 @@ describe('pluginReactRouter', () => {
       import: expect.stringMatching(/entry\.client/),
       html: false,
     });
-    expect(webEntries['virtual/react-router/browser-manifest']).toEqual({
-      import: 'virtual/react-router/browser-manifest',
-      html: false,
-    });
+    expect(Object.keys(webEntries)).not.toContain(
+      'virtual/react-router/browser-manifest'
+    );
     expect(webEntries['routes/index']).toMatchObject({
       html: false,
     });

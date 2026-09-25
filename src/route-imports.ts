@@ -1,8 +1,28 @@
-import type { Rspack } from '@rsbuild/core';
+import { realpathSync } from 'node:fs';
 import { resolve } from 'pathe';
+import { rspack, type Rspack } from '@rsbuild/core';
 
-import { JS_EXTENSIONS, PLUGIN_NAME } from './constants.js';
+import { PLUGIN_NAME } from './constants.js';
 import type { Route } from './types.js';
+
+export const createRouteFilePathMap = (
+  appDirectory: string,
+  routes: Record<string, Route>
+): Map<string, Route> => {
+  const routeByFilePath = new Map<string, Route>();
+  for (const route of Object.values(routes)) {
+    const filePath = resolve(appDirectory, route.file);
+    routeByFilePath.set(filePath, route);
+    try {
+      routeByFilePath.set(resolve(realpathSync(filePath)), route);
+    } catch (error) {
+      // Leave missing/generated routes for the compiler to diagnose.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+    }
+  }
+  return routeByFilePath;
+};
 
 type QuerylessRouteImportPlugin = {
   name: string;
@@ -17,62 +37,58 @@ const CLASSIC_CLIENT_ROUTE_MODULE_QUERY = '?react-router-route';
 const isRscClientRouteModuleIssuer = (issuer: string): boolean =>
   issuer.includes(RSC_CLIENT_ROUTE_MODULE_QUERY_PREFIX);
 
+const isEligibleRouteIssuer = (
+  issuer: string,
+  compilerName: string | undefined,
+  rsc: boolean,
+  routeByFilePath: ReadonlyMap<string, Route>
+): boolean =>
+  routeByFilePath.has(issuer.split('?')[0]) &&
+  (rsc || compilerName === 'web' || isRscClientRouteModuleIssuer(issuer));
+
 export const resolveQuerylessRouteImportRequest = ({
   compilerName,
-  context,
   issuer,
+  issuerLayer,
   rsc = false,
   request,
+  resolvedPath,
   routeByFilePath,
 }: {
   compilerName?: string;
-  context?: string;
   issuer?: string;
+  issuerLayer?: string;
   rsc?: boolean;
   request?: string;
+  resolvedPath: string;
   routeByFilePath: ReadonlyMap<string, Route>;
 }): string | undefined => {
   if (
     typeof request !== 'string' ||
-    typeof context !== 'string' ||
     typeof issuer !== 'string' ||
     request.includes('?') ||
-    (!request.startsWith('.') && !request.startsWith('/'))
+    !isEligibleRouteIssuer(issuer, compilerName, rsc, routeByFilePath)
   ) {
     return;
   }
 
-  const issuerPath = issuer.split('?')[0];
-  if (!routeByFilePath.has(issuerPath)) {
-    return;
-  }
-
-  const isRscClientIssuer = isRscClientRouteModuleIssuer(issuer);
+  const isRscClientIssuer =
+    isRscClientRouteModuleIssuer(issuer) ||
+    (rsc && issuerLayer === rspack.experiments.rsc.Layers.ssr);
   const isWebCompiler = compilerName === 'web';
-  if (!rsc && !isWebCompiler && !isRscClientIssuer) {
-    return;
-  }
-
-  const candidate = resolve(context, request);
-  const routeFilePath = routeByFilePath.has(candidate)
-    ? candidate
-    : JS_EXTENSIONS.map(extension => `${candidate}${extension}`).find(
-        candidate => routeByFilePath.has(candidate)
-      );
-
-  if (!routeFilePath) {
+  if (!routeByFilePath.has(resolvedPath)) {
     return;
   }
 
   if (!rsc && isWebCompiler) {
-    return `${routeFilePath}${CLASSIC_CLIENT_ROUTE_MODULE_QUERY}`;
+    return `${resolvedPath}${CLASSIC_CLIENT_ROUTE_MODULE_QUERY}`;
   }
 
   if (isWebCompiler || isRscClientIssuer) {
-    return `${routeFilePath}${RSC_SHARED_CLIENT_ROUTE_MODULE_QUERY}`;
+    return `${resolvedPath}${RSC_SHARED_CLIENT_ROUTE_MODULE_QUERY}`;
   }
 
-  return `${routeFilePath}${RSC_SERVER_ROUTE_MODULE_QUERY}`;
+  return `${resolvedPath}${RSC_SERVER_ROUTE_MODULE_QUERY}`;
 };
 
 export const createQuerylessRouteImportPlugin = (
@@ -82,17 +98,25 @@ export const createQuerylessRouteImportPlugin = (
   name: `${PLUGIN_NAME}:queryless-route-imports`,
   apply(compiler: Rspack.Compiler) {
     compiler.hooks.normalModuleFactory.tap(PLUGIN_NAME, factory => {
-      factory.hooks.beforeResolve.tap(PLUGIN_NAME, data => {
+      factory.hooks.afterResolve.tap(PLUGIN_NAME, data => {
+        const createData = data.createData;
+        if (!createData) {
+          return;
+        }
         const resolvedRequest = resolveQuerylessRouteImportRequest({
           compilerName: compiler.options?.name,
-          context: data?.context ?? data?.contextInfo?.issuer,
-          issuer: data?.contextInfo?.issuer,
+          issuer: data.contextInfo.issuer,
+          issuerLayer: data.contextInfo.issuerLayer,
           rsc: options.rsc,
-          request: data?.request,
+          request: data.request,
+          resolvedPath: createData.resource,
           routeByFilePath,
         });
         if (resolvedRequest) {
-          data.request = resolvedRequest;
+          const query = resolvedRequest.slice(createData.resource.length);
+          createData.resource = resolvedRequest;
+          createData.request += query;
+          createData.userRequest += query;
         }
       });
     });

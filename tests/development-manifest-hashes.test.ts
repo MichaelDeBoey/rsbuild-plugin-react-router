@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
@@ -10,7 +10,6 @@ import {
   type Rspack,
 } from '@rsbuild/core';
 import { describe, expect, it } from '@rstest/core';
-import { BROWSER_MANIFEST_ENTRY_NAME } from '../src/constants';
 import { getRouteModuleAnalysis } from '../src/export-utils';
 import {
   createReactRouterManifestStats,
@@ -48,8 +47,7 @@ const getJavaScriptAsset = (
   return file;
 };
 
-const readBrowserManifest = (compilation: Rspack.Compilation) => {
-  const name = getJavaScriptAsset(compilation, BROWSER_MANIFEST_ENTRY_NAME);
+const readBrowserManifest = (compilation: Rspack.Compilation, name: string) => {
   const context: {
     window: { __reactRouterManifest?: ReactRouterManifestForDev };
   } = { window: {} };
@@ -68,7 +66,8 @@ const readBrowserManifest = (compilation: Rspack.Compilation) => {
 
 const compileDevelopmentManifest = async (
   realContentHash: boolean,
-  changeRouteSource = false
+  changeRouteSource = false,
+  rebuild = false
 ) => {
   const root = mkdtempSync(join(tmpdir(), 'rr-dev-manifest-hashes-'));
   const pageFile = join(root, 'page.js');
@@ -77,12 +76,11 @@ const compileDevelopmentManifest = async (
     page: { id: 'page', parentId: 'root', file: 'page.js', path: 'page' },
   };
   const manifestChunkNames = getReactRouterManifestChunkNames(routes, root);
-  manifestChunkNames.add(BROWSER_MANIFEST_ENTRY_NAME);
   const publications: ManifestPublication[] = [];
   let activeStage: ProcessAssetsDescriptor['stage'] | undefined;
   let afterAdditions = 0;
   let afterHash = 0;
-  let early: ReturnType<typeof readBrowserManifest> | undefined;
+  let early: string | undefined;
 
   writeFileSync(
     join(root, 'entry.client.js'),
@@ -98,10 +96,6 @@ const compileDevelopmentManifest = async (
      export const loader = () => 'compiled-server';
      export default function Page() { return 'compiled-page'; }`
   );
-  writeFileSync(
-    join(root, 'browser-manifest.js'),
-    `window.__reactRouterManifest = "PLACEHOLDER";`
-  );
 
   const compiledAnalysis = new Map(await Promise.all(Object.values(routes).map(async route => { const file = join(root, route.file); return [file, await getRouteModuleAnalysis(file)] as const; })));
   const compiler = rspack({
@@ -113,7 +107,6 @@ const compileDevelopmentManifest = async (
       'entry.client': './entry.client.js',
       root: './root.js',
       page: './page.js',
-      [BROWSER_MANIFEST_ENTRY_NAME]: './browser-manifest.js',
     },
     output: {
       path: join(root, 'dist'),
@@ -130,7 +123,11 @@ const compileDevelopmentManifest = async (
     plugins: [
       {
         apply(compiler: Rspack.Compiler) {
-          const api: Pick<RsbuildPluginAPI, 'processAssets'> = {
+          const api: Pick<
+            RsbuildPluginAPI,
+            'processAssets' | 'onBeforeCreateCompiler'
+          > = {
+            onBeforeCreateCompiler() {},
             processAssets(descriptor, handler) {
               const stage = stages.get(descriptor.stage);
               if (stage === undefined) {
@@ -192,7 +189,7 @@ const compileDevelopmentManifest = async (
                 },
                 () => {
                   afterAdditions = publications.length;
-                  early = readBrowserManifest(compilation);
+                  early = getJavaScriptAsset(compilation, 'entry.client');
                   if (changeRouteSource) {
                     writeFileSync(
                       pageFile,
@@ -214,7 +211,7 @@ const compileDevelopmentManifest = async (
                   compilation.updateAsset(
                     name,
                     new rspack.sources.RawSource(
-                      `${source.source().toString()}\nglobalThis.__lateDevelopmentManifestTest = true;`
+                      `${source.source().toString()}\nglobalThis.__lateDevelopmentManifestTest = ${publications.length};`
                     )
                   );
                 }
@@ -235,7 +232,9 @@ const compileDevelopmentManifest = async (
       },
     ],
   });
-  compiler.hooks.shouldEmit.tap('DevelopmentManifestHashesTest', () => false);
+  if (!rebuild) {
+    compiler.hooks.shouldEmit.tap('DevelopmentManifestHashesTest', () => false);
+  }
 
   try {
     const stats = await new Promise<Rspack.Stats>((resolve, reject) => {
@@ -253,13 +252,52 @@ const compileDevelopmentManifest = async (
       throw new Error('The compilation did not reach manifest additions');
     }
     const compilation = stats.compilation;
+    const emitted = readBrowserManifest(
+      compilation,
+      publications[0].manifest.url.slice(assetPrefix.length)
+    );
+    let retainedManifest:
+      | { original: string; retained: string; next: string }
+      | undefined;
+    if (rebuild) {
+      const originalPath = join(
+        root,
+        'dist',
+        publications[0].manifest.url.slice(assetPrefix.length)
+      );
+      const original = readFileSync(originalPath, 'utf8');
+      const entryPath = join(root, 'entry.client.js');
+      writeFileSync(entryPath, `console.log('rebuilt-entry');`);
+      compiler.purgeInputFileSystem();
+      compiler.modifiedFiles = new Set([entryPath]);
+      await new Promise<void>((resolve, reject) => {
+        compiler.run((error, nextStats) => {
+          if (error) {
+            reject(error);
+          } else if (!nextStats || nextStats.hasErrors()) {
+            reject(new Error(nextStats?.toString({ all: false, errors: true })));
+          } else {
+            resolve();
+          }
+        });
+      });
+      retainedManifest = {
+        original,
+        retained: readFileSync(originalPath, 'utf8'),
+        next: readFileSync(
+          join(root, 'dist', publications[1].manifest.url.slice(assetPrefix.length)),
+          'utf8'
+        ),
+      };
+    }
     return {
+      retainedManifest,
       compilation,
       publications,
       afterAdditions,
       afterHash,
       early,
-      emitted: readBrowserManifest(compilation),
+      emitted,
       manifestStats: createReactRouterManifestStats(
         compilation,
         manifestChunkNames
@@ -284,6 +322,20 @@ const compileDevelopmentManifest = async (
 };
 
 describe('development manifests with content hashes', () => {
+  it('retains the previous manifest bytes after a new compilation emits', async () => {
+    const result = await compileDevelopmentManifest(true, false, true);
+    const [previous, next] = result.publications;
+    expect(previous.manifest.url).not.toBe(next.manifest.url);
+    expect(result.retainedManifest?.retained).toBe(
+      result.retainedManifest?.original
+    );
+    expect(result.retainedManifest?.next).not.toBe(
+      result.retainedManifest?.original
+    );
+    expect(result.retainedManifest?.retained).toContain(previous.manifest.version);
+    expect(result.retainedManifest?.next).toContain(next.manifest.version);
+  });
+
   it('publishes final asset URLs with compiled route facts', async () => {
     const result = await compileDevelopmentManifest(true, true);
 
@@ -311,13 +363,13 @@ describe('development manifests with content hashes', () => {
     expect(result.compiledPageSource).not.toContain('edited-action');
 
     const browser = result.emitted.manifest;
-    expect(browser.url).toBe(`${assetUrl(result.emitted.name)}?v=${browser.version}`);
+    expect(browser.url).toBe(assetUrl(result.emitted.name));
     expect(browser.entry.module).toBe(assetUrl(result.entryFile));
     expect(browser.entry.imports).toEqual([]);
     expect(browser.routes.root.module).toBe(assetUrl(result.rootFile));
     expect(browser.routes.page.module).toBe(assetUrl(result.pageFile));
     expect(browser.routes.page.imports).toEqual([]);
-    expect(result.assetNames.has(result.early.name)).toBe(false);
+    expect(result.assetNames.has(result.early)).toBe(false);
     for (const url of [
       browser.url,
       browser.entry.module,
@@ -328,7 +380,7 @@ describe('development manifests with content hashes', () => {
       ]),
     ]) {
       expect(url.startsWith(assetPrefix)).toBe(true);
-      expect(result.assetNames.has(url.slice(assetPrefix.length).replace(/\?v=.*$/, ''))).toBe(true);
+      expect(result.assetNames.has(url.slice(assetPrefix.length))).toBe(true);
     }
   });
 
@@ -342,8 +394,8 @@ describe('development manifests with content hashes', () => {
     ]);
     expect(result.publications[0].compilation).toBe(result.compilation);
     expect(result.publications[0].manifest).toEqual(result.emitted.manifest);
-    expect(result.emitted.name).toBe(result.early.name);
-    expect(result.emitted.manifest.url).toBe(`${assetUrl(result.emitted.name)}?v=${result.emitted.manifest.version}`);
+    expect(result.assetNames.has(result.early)).toBe(true);
+    expect(result.emitted.manifest.url).toBe(assetUrl(result.emitted.name));
     expect(result.emitted.manifest.entry.module).toBe(
       assetUrl(result.entryFile)
     );
