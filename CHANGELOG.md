@@ -1,5 +1,22 @@
 # rsbuild-plugin-react-router
 
+## 0.8.1
+
+### Patch Changes
+
+- 0ad5302: Preserve compiled route analysis in Rspack module metadata so persistent-cache hits retain MDX and other transformed route exports. Reject inferred reserved root IDs and non-string route IDs before building, and resolve RSC support checks from the configured project root.
+- 0ad5302: Resolve configuration, version-dependent defaults, typegen, and build paths from the Rsbuild project root, reject collisions between route entries and generated split chunks, and only include emitted CSS assets in development manifests.
+
+  Preserve RSC chunk loading in federation builds and keep consuming federation hosts on the shared application runtime. Handle RSC SPA fallbacks under a basename, escape prerendered redirect HTML, and avoid consuming unused redirect response bodies.
+
+- 0ad5302: Recognize route imports after native resolution, preserving aliases, dependency-specific conditions, extension priority, TypeScript paths, and symlinks while keeping server-only exports out of client bundles and preserving one module instance for repeated route imports.
+
+  Publish CSS and loader edits with the new server build, retain pending client and server edits across retries, send CSS ownership reloads only after successful commits, and defer fallback RSC revalidation until pending compilations succeed.
+
+  Emit versioned browser manifests in development so a document can fetch the manifest generation it rendered with after a later rebuild.
+
+- 74c0caf: Fix prerendering a root route with a loader on React Router 8 by requesting `/_.data` instead of the legacy `/_root.data` path, which React Router 8 handlers no longer recognize.
+
 ## 0.8.0
 
 ### Minor Changes
