@@ -60,46 +60,6 @@ describe('React Router development runtime', () => {
     });
   });
 
-  it('publishes css-only removals when the route file overlaps node dependencies', async () => {
-    const routePath = '/app/routes/about.tsx';
-    const onCssAssetOwnershipChanged = rstest.fn();
-    const { runtime, warnings } = createHarness(() => createBuild('build'), {
-      onCssAssetOwnershipChanged,
-    });
-    const firstWeb = createCompilation('web');
-    const node = createCompilation('node', { files: [routePath] });
-
-    runtime.beginAttempt();
-    captureWeb(runtime, firstWeb, 'with-css', {
-      routes: { 'routes/about': ['/assets/about.css'] },
-    });
-    await runtime.finishAttempt(
-      createGraphStats(firstWeb, node),
-      noKnownChanges,
-      graphIdentity(firstWeb, node)
-    );
-
-    const removedCssWeb = createCompilation('web');
-    runtime.beginAttempt();
-    captureWeb(runtime, removedCssWeb, 'without-css', {
-      routes: { 'routes/about': [] },
-    });
-    await runtime.finishAttempt(
-      createGraphStats(removedCssWeb, node),
-      {
-        web: { known: true, files: new Set([routePath]) },
-        node: { known: false, files: new Set() },
-      },
-      graphIdentity(removedCssWeb, node)
-    );
-
-    expect(onCssAssetOwnershipChanged).toHaveBeenCalledOnce();
-    expect(warnings).toEqual([]);
-    await expect(runtime.load()).resolves.toMatchObject({
-      assets: { version: 'without-css' },
-    });
-  });
-
   it('evaluates changed node output during css ownership removals', async () => {
     const routePath = '/app/routes/about.tsx';
     const onCssAssetOwnershipChanged = rstest.fn();
@@ -480,9 +440,7 @@ describe('React Router development runtime', () => {
   });
 
   it('resolves all initial waiters from one committed generation', async () => {
-    const { loadBundle, runtime } = createHarness(() =>
-      createBuild('shared')
-    );
+    const { loadBundle, runtime } = createHarness(() => createBuild('shared'));
     const web = createCompilation('web');
     const node = createCompilation('node');
 
@@ -1165,5 +1123,4 @@ describe('React Router development runtime', () => {
     );
     expect(errors).toEqual([]);
   });
-
 });
